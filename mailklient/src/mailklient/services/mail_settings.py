@@ -60,7 +60,9 @@ def _get_oauth_access_token(account: Account) -> str | None:
             refresh_token=tokens.refresh_token,
             client_secret=get_oauth_client_secret(account.oauth_provider),
         )
-    except (KeyError, OAuthCallbackError, OAuthClientConfigError):
+    except (KeyError, OAuthCallbackError, OAuthClientConfigError, OSError, ValueError):
+        if not is_oauth_token_expired(tokens, refresh_margin_seconds=0):
+            return tokens.access_token
         return None
 
     save_oauth_tokens(account.email_address, refreshed_tokens)

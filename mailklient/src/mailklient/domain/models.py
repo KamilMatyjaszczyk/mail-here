@@ -50,3 +50,20 @@ class Message:
     received_at: str | None = None
     is_read: bool = False
     body_preview: str = ""
+    body_text: str = ""
+    body_html: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class Attachment:
+    """Attachment metadata stored in the local cache."""
+
+    id: int
+    message_id: int
+    filename: str
+    content_type: str
+    size: int
+    content_id: str | None = None
+    is_inline: bool = False
+    has_content: bool = False
+    content: bytes | None = None

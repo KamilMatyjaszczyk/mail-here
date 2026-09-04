@@ -28,6 +28,9 @@ def initialize_database(database_path: DatabasePath) -> None:
         connection.executescript(_load_schema())
         _ensure_account_server_columns(connection)
         _ensure_message_imap_columns(connection)
+        _ensure_message_body_columns(connection)
+        _ensure_folder_sync_state_table(connection)
+        _ensure_attachments_table(connection)
 
 
 def _load_schema() -> str:
@@ -73,3 +76,67 @@ def _ensure_message_imap_columns(connection: sqlite3.Connection) -> None:
             connection.execute(
                 f"ALTER TABLE messages ADD COLUMN {column_name} {column_definition}"
             )
+
+
+def _ensure_message_body_columns(connection: sqlite3.Connection) -> None:
+    existing_columns = {
+        row["name"] for row in connection.execute("PRAGMA table_info(messages)")
+    }
+    columns = {
+        "body_text": "TEXT NOT NULL DEFAULT ''",
+        "body_html": "TEXT NOT NULL DEFAULT ''",
+    }
+
+    for column_name, column_definition in columns.items():
+        if column_name not in existing_columns:
+            connection.execute(
+                f"ALTER TABLE messages ADD COLUMN {column_name} {column_definition}"
+            )
+
+
+def _ensure_folder_sync_state_table(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS folder_sync_state (
+            account_id INTEGER NOT NULL,
+            folder_id INTEGER NOT NULL,
+            last_seen_uid INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (account_id, folder_id),
+            FOREIGN KEY (account_id) REFERENCES accounts (id) ON DELETE CASCADE,
+            FOREIGN KEY (folder_id) REFERENCES folders (id) ON DELETE CASCADE,
+            FOREIGN KEY (folder_id, account_id) REFERENCES folders (id, account_id)
+                ON DELETE CASCADE
+        )
+        """
+    )
+
+
+def _ensure_attachments_table(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS attachments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_id INTEGER NOT NULL,
+            filename TEXT NOT NULL,
+            content_type TEXT NOT NULL,
+            size INTEGER NOT NULL DEFAULT 0 CHECK (size >= 0),
+            content_id TEXT,
+            is_inline INTEGER NOT NULL DEFAULT 0 CHECK (is_inline IN (0, 1)),
+            content BLOB,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (message_id) REFERENCES messages (id) ON DELETE CASCADE
+        )
+        """
+    )
+    existing_columns = {
+        row["name"] for row in connection.execute("PRAGMA table_info(attachments)")
+    }
+    if "content" not in existing_columns:
+        connection.execute("ALTER TABLE attachments ADD COLUMN content BLOB")
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_attachments_message_id
+        ON attachments (message_id)
+        """
+    )

@@ -13,7 +13,8 @@ def seed_demo_data(store: MailStore) -> None:
     account = store.add_account("Demo", "demo@example.com")
     inbox = store.add_folder(account.id, "Innboks")
     sent = store.add_folder(account.id, "Sendt")
-    store.add_folder(account.id, "Arkiv")
+    store.add_folder(account.id, "Søppelpost")
+    store.add_folder(account.id, "Papirkurv")
 
     store.add_message(
         account.id,

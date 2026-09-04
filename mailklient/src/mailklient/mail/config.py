@@ -62,6 +62,20 @@ class ImapFolder:
     """A folder reported by an IMAP server."""
 
     name: str
+    flags: tuple[str, ...] = ()
+    delimiter: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ImapAttachment:
+    """Attachment metadata fetched from an IMAP message."""
+
+    filename: str
+    content_type: str
+    size: int
+    content_id: str | None = None
+    is_inline: bool = False
+    content: bytes | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +89,18 @@ class ImapMessageHeader:
     sender: str = ""
     recipients: str = ""
     date: str | None = None
+    body_text: str = ""
+    body_html: str = ""
+    body_preview: str = ""
+    attachments: tuple[ImapAttachment, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ImapMessageFlags:
+    """Flags for one message fetched without downloading the full body."""
+
+    uid: str
+    flags: tuple[str, ...] = ()
 
 
 MAIL_PROVIDER_DEFAULTS = {

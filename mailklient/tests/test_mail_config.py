@@ -212,6 +212,49 @@ def test_get_mail_account_settings_refreshes_expired_oauth_token(
     ]
 
 
+def test_get_mail_account_settings_uses_valid_token_when_refresh_margin_fails(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    store = MailStore(tmp_path / "mailklient.sqlite3")
+    account = store.add_account(
+        "Privat",
+        "privat@example.com",
+        auth_method="oauth2",
+        oauth_provider="gmail",
+        imap_host="imap.gmail.com",
+        imap_port=993,
+        smtp_host="smtp.gmail.com",
+        smtp_port=587,
+    )
+    almost_expired_at = (datetime.now(UTC) + timedelta(seconds=30)).isoformat()
+
+    monkeypatch.setattr(
+        mail_settings,
+        "get_oauth_tokens",
+        lambda _email: OAuthTokens(
+            access_token="still-valid",
+            refresh_token="refresh",
+            expires_at=almost_expired_at,
+        ),
+    )
+    monkeypatch.setattr(
+        mail_settings,
+        "get_oauth_client_id",
+        lambda _provider: "client-id",
+    )
+    monkeypatch.setattr(
+        mail_settings,
+        "refresh_access_token",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("offline")),
+    )
+
+    settings = mail_settings.get_mail_account_settings(store, account.id)
+
+    assert settings is not None
+    assert settings.imap.password == "still-valid"
+
+
 def test_get_mail_account_settings_returns_none_for_oauth_without_tokens(
     tmp_path,
     monkeypatch,
