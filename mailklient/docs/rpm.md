@@ -12,10 +12,10 @@ Download the file ending in **`.noarch.rpm`** from the project's
 once a release has been published. `.src.rpm` is the source package, not the app.
 RPM files are not stored in Git; a regular clone contains the build configuration.
 
-From the directory containing the RPM file, for version 0.1.0:
+From the directory containing the RPM file, for version 1.0.0:
 
 ```bash
-sudo dnf install ./mcpmail-0.1.0-1.fc44.noarch.rpm
+sudo dnf install ./mcpmail-1.0.0-1.fc44.noarch.rpm
 mcpMail
 ```
 
@@ -57,8 +57,8 @@ build; pytest still runs. Docker can be used with `--engine docker`.
 
 The output is placed in `mailklient/dist/rpm/`:
 
-- `mcpmail-0.1.0-1.fc44.noarch.rpm`: installable app.
-- `mcpmail-0.1.0-1.fc44.src.rpm`: source code and RPM spec.
+- `mcpmail-1.0.0-1.fc44.noarch.rpm`: installable app.
+- `mcpmail-1.0.0-1.fc44.src.rpm`: source code and RPM spec.
 - `SHA256SUMS`: checksums for both files.
 
 If both RPM files and the checksum file are in the same directory, run
@@ -77,11 +77,11 @@ the default branch. Successful builds provide a downloadable Actions artifact fo
 
 For a release, update the version in both `pyproject.toml` and
 `packaging/rpm/mcpmail.spec`, commit and push the changes, and create a matching
-tag. For example, for the first release:
+tag. For example, for version 1.0.0:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v1.0.0
+git push origin v1.0.0
 ```
 
 A successful tag build creates a **draft GitHub Release** with RPM files and

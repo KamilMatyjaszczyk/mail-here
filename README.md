@@ -46,7 +46,7 @@ Use the prebuilt `.noarch.rpm` file from
 has been published:
 
 ```bash
-sudo dnf install ./mcpmail-0.1.0-1.fc44.noarch.rpm
+sudo dnf install ./mcpmail-1.0.0-1.fc44.noarch.rpm
 mcpMail
 ```
 
