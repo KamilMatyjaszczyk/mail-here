@@ -19,3 +19,13 @@ mail-cache/
 mail_cache/
 attachments/
 downloads/
+draft-attachments/
+build/
+dist/
+.mypy_cache/
+.ruff_cache/
+client_secret*.json
+credentials*.json
+token*.json
+*.pem
+*.key

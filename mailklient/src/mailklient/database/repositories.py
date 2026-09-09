@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 
+from mailklient.database.thread_index import index_message_references
 from mailklient.domain import Account, Attachment, Folder, Message
 
 
@@ -20,6 +21,8 @@ def create_account(
     smtp_security: str = "starttls",
     auth_method: str = "password",
     oauth_provider: str | None = None,
+    provider: str = "imap",
+    local_certificate: str | None = None,
 ) -> Account:
     """Create and return an account."""
     cursor = connection.execute(
@@ -35,9 +38,11 @@ def create_account(
             imap_security,
             smtp_host,
             smtp_port,
-            smtp_security
+            smtp_security,
+            provider,
+            local_certificate
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             display_name,
@@ -51,6 +56,8 @@ def create_account(
             smtp_host,
             smtp_port,
             smtp_security,
+            provider,
+            local_certificate,
         ),
     )
     connection.commit()
@@ -69,7 +76,9 @@ def create_account(
             imap_security,
             smtp_host,
             smtp_port,
-            smtp_security
+            smtp_security,
+            provider,
+            local_certificate
         FROM accounts
         WHERE id = ?
         """,
@@ -95,7 +104,9 @@ def list_accounts(connection: sqlite3.Connection) -> list[Account]:
             imap_security,
             smtp_host,
             smtp_port,
-            smtp_security
+            smtp_security,
+            provider,
+            local_certificate
         FROM accounts
         ORDER BY display_name COLLATE NOCASE, email_address COLLATE NOCASE
         """
@@ -120,7 +131,9 @@ def get_account(connection: sqlite3.Connection, account_id: int) -> Account | No
             imap_security,
             smtp_host,
             smtp_port,
-            smtp_security
+            smtp_security,
+            provider,
+            local_certificate
         FROM accounts
         WHERE id = ?
         """,
@@ -131,6 +144,52 @@ def get_account(connection: sqlite3.Connection, account_id: int) -> Account | No
         return None
 
     return _account_from_row(row)
+
+
+def update_account(connection: sqlite3.Connection, account: Account) -> Account:
+    """Update metadata while retaining account, folder and message identities."""
+    previous = get_account(connection, account.id)
+    if previous is None:
+        raise ValueError("The account no longer exists.")
+    connection.execute(
+        "UPDATE accounts SET display_name = ?, username = ?, imap_host = ?, "
+        "imap_port = ?, imap_security = ?, smtp_host = ?, smtp_port = ?, "
+        "smtp_security = ?, local_certificate = ? WHERE id = ?",
+        (
+            account.display_name,
+            account.username,
+            account.imap_host,
+            account.imap_port,
+            account.imap_security,
+            account.smtp_host,
+            account.smtp_port,
+            account.smtp_security,
+            account.local_certificate,
+            account.id,
+        ),
+    )
+    if (
+        previous.imap_host,
+        previous.imap_port,
+        previous.imap_security,
+        previous.username,
+    ) != (
+        account.imap_host,
+        account.imap_port,
+        account.imap_security,
+        account.username,
+    ):
+        # Never apply cached UIDs to an edited server before a fresh sync.
+        connection.execute(
+            "INSERT INTO folder_sync_state (account_id, folder_id, last_seen_uid, uidvalidity) "
+            "SELECT account_id, id, 0, NULL FROM folders WHERE account_id = ? "
+            "ON CONFLICT(account_id, folder_id) DO UPDATE SET "
+            "last_seen_uid = 0, uidvalidity = NULL, updated_at = CURRENT_TIMESTAMP",
+            (account.id,),
+        )
+    updated = get_account(connection, account.id)
+    assert updated is not None
+    return updated
 
 
 def delete_account(connection: sqlite3.Connection, account_id: int) -> bool:
@@ -269,12 +328,16 @@ def upsert_message(
     subject: str = "",
     sender: str = "",
     recipients: str = "",
+    reply_to: str = "",
     sent_at: str | None = None,
     received_at: str | None = None,
     is_read: bool = False,
     body_preview: str = "",
     body_text: str = "",
     body_html: str = "",
+    in_reply_to: str = "",
+    references: str = "",
+    body_fetch_failed: bool = False,
 ) -> Message:
     """Create or update message metadata by IMAP UID or message id."""
     existing_message = _find_existing_message(
@@ -286,6 +349,12 @@ def upsert_message(
     )
 
     if existing_message is not None:
+        if body_fetch_failed and (
+            existing_message.body_text or existing_message.body_html
+        ):
+            body_text = existing_message.body_text
+            body_html = existing_message.body_html
+            body_preview = existing_message.body_preview
         connection.execute(
             """
             UPDATE messages
@@ -296,12 +365,16 @@ def upsert_message(
                 subject = ?,
                 sender = ?,
                 recipients = ?,
+                reply_to = ?,
                 sent_at = ?,
                 received_at = ?,
                 is_read = ?,
                 body_preview = ?,
                 body_text = ?,
-                body_html = ?
+                body_html = ?,
+                in_reply_to = ?,
+                "references" = ?,
+                body_fetch_failed = ?
             WHERE id = ?
             """,
             (
@@ -311,19 +384,26 @@ def upsert_message(
                 subject,
                 sender,
                 recipients,
+                reply_to,
                 sent_at,
                 received_at,
                 int(is_read),
                 body_preview,
                 body_text,
                 body_html,
+                in_reply_to,
+                references,
+                int(body_fetch_failed),
                 existing_message.id,
             ),
+        )
+        index_message_references(
+            connection, existing_message.id, message_id, in_reply_to, references
         )
         connection.commit()
         return _get_message(connection, existing_message.id)
 
-    connection.execute(
+    cursor = connection.execute(
         """
         INSERT INTO messages (
             account_id,
@@ -334,14 +414,18 @@ def upsert_message(
             subject,
             sender,
             recipients,
+            reply_to,
             sent_at,
             received_at,
             is_read,
             body_preview,
             body_text,
-            body_html
+            body_html,
+            in_reply_to,
+            "references",
+            body_fetch_failed
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             account_id,
@@ -352,13 +436,21 @@ def upsert_message(
             subject,
             sender,
             recipients,
+            reply_to,
             sent_at,
             received_at,
             int(is_read),
             body_preview,
             body_text,
             body_html,
+            in_reply_to,
+            references,
+            int(body_fetch_failed),
         ),
+    )
+    assert cursor.lastrowid is not None
+    index_message_references(
+        connection, cursor.lastrowid, message_id, in_reply_to, references
     )
     connection.commit()
 
@@ -374,15 +466,19 @@ def upsert_message(
             subject,
             sender,
             recipients,
+            reply_to,
             sent_at,
             received_at,
             is_read,
             body_preview,
             body_text,
-            body_html
+            body_html,
+            in_reply_to,
+            "references"
         FROM messages
-        WHERE id = last_insert_rowid()
+        WHERE id = ?
         """,
+        (cursor.lastrowid,),
     ).fetchone()
 
     return _message_from_row(row)
@@ -405,12 +501,15 @@ def get_message(
             subject,
             sender,
             recipients,
+            reply_to,
             sent_at,
             received_at,
             is_read,
             body_preview,
             body_text,
-            body_html
+            body_html,
+            in_reply_to,
+            "references"
         FROM messages
         WHERE id = ?
         """,
@@ -438,6 +537,7 @@ def list_attachments_for_message(
             size,
             content_id,
             is_inline,
+            imap_section,
             content IS NOT NULL AS has_content
         FROM attachments
         WHERE message_id = ?
@@ -475,9 +575,10 @@ def replace_message_attachments(
             size,
             content_id,
             is_inline,
+            imap_section,
             content
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [
             (
@@ -487,6 +588,7 @@ def replace_message_attachments(
                 attachment.size,
                 attachment.content_id,
                 int(attachment.is_inline),
+                attachment.imap_section,
                 attachment.content
                 if attachment.content is not None
                 else existing_content.get(attachment.id),
@@ -513,6 +615,8 @@ def get_attachment_content(
 
     if row is None:
         return None
+    connection.execute("UPDATE attachments SET accessed_at = CURRENT_TIMESTAMP WHERE id = ?", (attachment_id,))
+    connection.commit()
     return row["content"]
 
 
@@ -525,7 +629,7 @@ def set_attachment_content(
     connection.execute(
         """
         UPDATE attachments
-        SET content = ?, size = ?
+        SET content = ?, size = ?, accessed_at = CURRENT_TIMESTAMP
         WHERE id = ?
         """,
         (content, len(content), attachment_id),
@@ -544,12 +648,15 @@ def create_message(
     subject: str = "",
     sender: str = "",
     recipients: str = "",
+    reply_to: str = "",
     sent_at: str | None = None,
     received_at: str | None = None,
     is_read: bool = False,
     body_preview: str = "",
     body_text: str = "",
     body_html: str = "",
+    in_reply_to: str = "",
+    references: str = "",
 ) -> Message:
     """Create and return message metadata."""
     cursor = connection.execute(
@@ -563,14 +670,17 @@ def create_message(
             subject,
             sender,
             recipients,
+            reply_to,
             sent_at,
             received_at,
             is_read,
             body_preview,
             body_text,
-            body_html
+            body_html,
+            in_reply_to,
+            "references"
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             account_id,
@@ -581,13 +691,20 @@ def create_message(
             subject,
             sender,
             recipients,
+            reply_to,
             sent_at,
             received_at,
             int(is_read),
             body_preview,
             body_text,
             body_html,
+            in_reply_to,
+            references,
         ),
+    )
+    assert cursor.lastrowid is not None
+    index_message_references(
+        connection, cursor.lastrowid, message_id, in_reply_to, references
     )
     connection.commit()
 
@@ -603,12 +720,15 @@ def create_message(
             subject,
             sender,
             recipients,
+            reply_to,
             sent_at,
             received_at,
             is_read,
             body_preview,
             body_text,
-            body_html
+            body_html,
+            in_reply_to,
+            "references"
         FROM messages
         WHERE id = ?
         """,
@@ -636,12 +756,15 @@ def list_messages_for_folder(
             subject,
             sender,
             recipients,
+            reply_to,
             sent_at,
             received_at,
             is_read,
             body_preview,
             body_text,
-            body_html
+            body_html,
+            in_reply_to,
+            "references"
         FROM messages
         WHERE account_id = ? AND folder_id = ?
         ORDER BY received_at DESC, sent_at DESC, id DESC
@@ -669,12 +792,15 @@ def list_unified_inbox_messages(
             messages.subject,
             messages.sender,
             messages.recipients,
+            messages.reply_to,
             messages.sent_at,
             messages.received_at,
             messages.is_read,
             messages.body_preview,
             messages.body_text,
-            messages.body_html
+            messages.body_html,
+            messages.in_reply_to,
+            messages."references"
         FROM messages
         JOIN folders ON folders.id = messages.folder_id
         WHERE folders.name COLLATE NOCASE IN ('INBOX', 'Innboks')
@@ -810,10 +936,24 @@ def move_message_to_folder(
     destination_folder_id: int,
 ) -> bool:
     """Move one cached message to another local folder."""
+    source = connection.execute(
+        "SELECT account_id, message_id FROM messages WHERE id = ?", (message_id,)
+    ).fetchone()
+    target = connection.execute(
+        "SELECT account_id FROM folders WHERE id = ?", (destination_folder_id,)
+    ).fetchone()
+    if source is None or target is None or source["account_id"] != target["account_id"]:
+        return False
+    duplicate = connection.execute(
+        "SELECT id FROM messages WHERE folder_id = ? AND message_id = ? AND id != ?",
+        (destination_folder_id, source["message_id"], message_id),
+    ).fetchone()
+    if duplicate is not None:
+        return delete_message(connection, message_id)
     cursor = connection.execute(
         """
         UPDATE messages
-        SET folder_id = ?
+        SET folder_id = ?, imap_uid = NULL
         WHERE id = ?
         """,
         (destination_folder_id, message_id),
@@ -842,31 +982,20 @@ def delete_messages_missing_from_folder(
     remote_uids: list[str],
 ) -> int:
     """Delete cached IMAP messages that no longer exist in a folder."""
-    if remote_uids:
-        placeholders = ", ".join("?" for _uid in remote_uids)
-        cursor = connection.execute(
-            f"""
-            DELETE FROM messages
-            WHERE account_id = ?
-                AND folder_id = ?
-                AND imap_uid IS NOT NULL
-                AND imap_uid != ''
-                AND imap_uid NOT IN ({placeholders})
-            """,
-            (account_id, folder_id, *remote_uids),
-        )
-    else:
-        cursor = connection.execute(
-            """
-            DELETE FROM messages
-            WHERE account_id = ?
-                AND folder_id = ?
-                AND imap_uid IS NOT NULL
-                AND imap_uid != ''
-            """,
-            (account_id, folder_id),
-        )
-
+    # A temporary table avoids SQLite's bound-parameter limit for large mailboxes.
+    connection.execute(
+        "CREATE TEMP TABLE IF NOT EXISTS remote_uids (uid TEXT PRIMARY KEY)"
+    )
+    connection.execute("DELETE FROM remote_uids")
+    connection.executemany(
+        "INSERT OR IGNORE INTO remote_uids VALUES (?)", ((uid,) for uid in remote_uids)
+    )
+    cursor = connection.execute(
+        "DELETE FROM messages WHERE account_id = ? AND folder_id = ? "
+        "AND imap_uid IS NOT NULL AND imap_uid != '' "
+        "AND NOT EXISTS (SELECT 1 FROM remote_uids WHERE uid = messages.imap_uid)",
+        (account_id, folder_id),
+    )
     connection.commit()
     return cursor.rowcount
 
@@ -892,12 +1021,15 @@ def _find_existing_message(
                 subject,
                 sender,
                 recipients,
+                reply_to,
                 sent_at,
                 received_at,
                 is_read,
                 body_preview,
                 body_text,
-                body_html
+                body_html,
+                in_reply_to,
+                "references"
             FROM messages
             WHERE account_id = ? AND folder_id = ? AND imap_uid = ?
             """,
@@ -919,12 +1051,15 @@ def _find_existing_message(
                 subject,
                 sender,
                 recipients,
+                reply_to,
                 sent_at,
                 received_at,
                 is_read,
                 body_preview,
                 body_text,
-                body_html
+                body_html,
+                in_reply_to,
+                "references"
             FROM messages
             WHERE account_id = ? AND folder_id = ? AND message_id = ?
             """,
@@ -949,12 +1084,15 @@ def _get_message(connection: sqlite3.Connection, message_id: int) -> Message:
             subject,
             sender,
             recipients,
+            reply_to,
             sent_at,
             received_at,
             is_read,
             body_preview,
             body_text,
-            body_html
+            body_html,
+            in_reply_to,
+            "references"
         FROM messages
         WHERE id = ?
         """,
@@ -978,6 +1116,8 @@ def _account_from_row(row: sqlite3.Row) -> Account:
         smtp_security=row["smtp_security"],
         auth_method=row["auth_method"],
         oauth_provider=row["oauth_provider"],
+        provider=row["provider"],
+        local_certificate=row["local_certificate"],
     )
 
 
@@ -1001,12 +1141,15 @@ def _message_from_row(row: sqlite3.Row) -> Message:
         subject=row["subject"],
         sender=row["sender"],
         recipients=row["recipients"],
+        reply_to=row["reply_to"],
         sent_at=row["sent_at"],
         received_at=row["received_at"],
         is_read=bool(row["is_read"]),
         body_preview=row["body_preview"],
         body_text=row["body_text"],
         body_html=row["body_html"],
+        in_reply_to=row["in_reply_to"],
+        references=row["references"],
     )
 
 
@@ -1015,6 +1158,7 @@ def _attachment_from_row(row: sqlite3.Row) -> Attachment:
         id=row["id"],
         message_id=row["message_id"],
         filename=row["filename"],
+        imap_section=row["imap_section"],
         content_type=row["content_type"],
         size=row["size"],
         content_id=row["content_id"],

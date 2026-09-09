@@ -21,6 +21,8 @@ class Account:
     smtp_security: str = "starttls"
     auth_method: str = "password"
     oauth_provider: str | None = None
+    provider: str = "imap"
+    local_certificate: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +54,9 @@ class Message:
     body_preview: str = ""
     body_text: str = ""
     body_html: str = ""
+    reply_to: str = ""
+    in_reply_to: str = ""
+    references: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,3 +72,4 @@ class Attachment:
     is_inline: bool = False
     has_content: bool = False
     content: bytes | None = None
+    imap_section: str | None = None

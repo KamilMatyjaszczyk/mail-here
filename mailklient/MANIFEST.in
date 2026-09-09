@@ -1,0 +1,8 @@
+include README.md
+include pyproject.toml
+include docs/oauth.md
+include docs/MCP_ARCHITECTURE.md
+include docs/rpm.md
+recursive-include src/mailklient *.py *.sql
+prune tests
+global-exclude *.py[cod] *.sqlite* *.db *.pem *.key .env* client_secret*.json credentials*.json token*.json

@@ -9,6 +9,7 @@ from mailklient.mail.config import (
 from mailklient.services import MailStore
 from mailklient.services import mail_sync
 from mailklient.services.mail_sync import HeaderSyncResult, MailSyncService
+from mailklient.mail.imap_client import _parse_folder
 
 
 class FakeImapClient:
@@ -159,6 +160,43 @@ def test_mail_sync_service_tests_imap_and_smtp_connections(
 
     assert service.test_imap_connection(account.id)
     assert service.test_smtp_connection(account.id)
+
+
+def test_outlook_sync_repairs_bad_remote_ids_and_populates_unified_inbox(
+    tmp_path, monkeypatch
+):
+    class OutlookClient(FakeImapClient):
+        def list_folders(self):
+            return [_parse_folder(line) for line in (
+                b'(\\HasNoChildren) "/" Inbox',
+                b'(\\HasNoChildren \\Sent) "/" Sent',
+                b'(\\HasChildren \\Trash) "/" Deleted',
+                b'(\\HasNoChildren \\Junk) "/" Junk',
+                b'(\\Noselect) "/" Parent',
+                b'(\\HasNoChildren) "/" Unrelated',
+            )]
+
+        def fetch_headers(self, folder_name, limit=25):
+            assert folder_name in {"Inbox", "Sent", "Deleted", "Junk"}
+            return super().fetch_headers(folder_name, limit)
+
+    store = MailStore(tmp_path / "cache.sqlite3")
+    account = store.add_account_with_default_folders(
+        "Outlook", "user@hotmail.com", auth_method="oauth2", oauth_provider="outlook"
+    )
+    inbox = store.get_or_add_folder(account.id, "Innboks", remote_id="/")
+    trash = store.get_or_add_folder(account.id, "Papirkurv", remote_id="/")
+    monkeypatch.setattr(
+        mail_sync, "get_mail_account_settings", lambda *_args: _settings_for(account.id)
+    )
+    result = MailSyncService(store, OutlookClient).fetch_imap_headers(account.id)
+    assert result == HeaderSyncResult(folders_seen=4, messages_seen=4)
+    assert store.get_folder(inbox.id).remote_id == "Inbox"
+    assert store.get_folder(trash.id).remote_id == "Deleted"
+    messages = store.list_unified_inbox_messages()
+    assert len(messages) == 1
+    assert messages[0].subject == "Fra Inbox"
+    assert messages[0].body_text == "Full tekst fra Inbox"
 
 
 def test_mail_sync_service_returns_false_when_settings_are_incomplete(
@@ -417,6 +455,7 @@ def test_mail_sync_service_archives_message_on_imap(
     monkeypatch,
 ) -> None:
     FakeImapClient.instances = []
+    monkeypatch.setattr(FakeImapClient, "list_folders", lambda self: [ImapFolder("Archive", ("\\Archive",))])
     store = MailStore(tmp_path / "mailklient.sqlite3")
     account = store.add_account("Privat", "privat@example.com")
     inbox = store.add_folder(account.id, "INBOX", remote_id="INBOX")
@@ -441,7 +480,8 @@ def test_mail_sync_service_archives_message_on_imap(
     archive = store.get_folder(moved_message.folder_id)
     assert archive is not None
     assert archive.name == "Arkiv"
-    assert FakeImapClient.instances[0].archived_messages == [("INBOX", "42")]
+    assert FakeImapClient.instances[-1].moved_messages == [("INBOX", "42", "Archive")]
+    assert moved_message.imap_uid is None
 
 
 def test_mail_sync_service_archives_gmail_by_removing_inbox_label(

@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import smtplib
-import ssl
 from collections.abc import Callable
+from contextlib import suppress
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 from mimetypes import guess_type
@@ -12,6 +12,7 @@ from pathlib import Path
 
 from mailklient.mail.config import SmtpSettings
 from mailklient.security import build_xoauth2_payload
+from mailklient.security.tls import create_mail_ssl_context
 
 SmtpConnectionFactory = Callable[..., smtplib.SMTP]
 SmtpSslConnectionFactory = Callable[..., smtplib.SMTP_SSL]
@@ -33,7 +34,10 @@ class SmtpClient:
     def test_connection(self) -> bool:
         """Connect, login, quit and report success."""
         connection = self._connect_and_authenticate()
-        connection.quit()
+        try:
+            connection.quit()
+        finally:
+            connection.close()
         return True
 
     def send_message(
@@ -68,40 +72,61 @@ class SmtpClient:
 
         connection = self._connect_and_authenticate()
         try:
-            connection.send_message(message, to_addrs=envelope_recipients)
+            refused = connection.send_message(message, to_addrs=envelope_recipients)
+            if refused:
+                raise smtplib.SMTPException(
+                    "The email was sent to some, but not all recipients. "
+                    "Check Sent and the recipients before sending again."
+                )
             return True
         finally:
-            connection.quit()
+            # A failed QUIT must not turn an accepted message into a send failure.
+            with suppress(Exception):
+                connection.quit()
+            with suppress(Exception):
+                connection.close()
 
     def _connect_and_authenticate(self):
-        context = ssl.create_default_context()
+        context = create_mail_ssl_context(
+            self._settings.host, self._settings.local_certificate
+        )
 
         if self._settings.security == "ssl":
             connection = self._ssl_connection_factory(
                 self._settings.host,
                 self._settings.port,
                 context=context,
+                timeout=self._settings.timeout,
             )
         elif self._settings.security == "starttls":
             connection = self._connection_factory(
                 self._settings.host,
                 self._settings.port,
+                timeout=self._settings.timeout,
             )
-            connection.starttls(context=context)
         else:
             raise ValueError(f"Unsupported SMTP security mode: {self._settings.security}")
 
-        if self._settings.auth_method == "oauth2":
-            connection.auth(
-                "XOAUTH2",
-                lambda _challenge=None: build_xoauth2_payload(
-                    self._settings.username,
-                    self._settings.password,
-                ),
-                initial_response_ok=True,
-            )
-        else:
-            connection.login(self._settings.username, self._settings.password)
+        try:
+            if self._settings.security == "starttls":
+                connection.starttls(context=context)
+            if self._settings.auth_method == "oauth2":
+                # EHLO after TLS must precede AUTH; a later EHLO can reset authentication.
+                connection.ehlo()
+                connection.auth(
+                    "XOAUTH2",
+                    lambda _challenge=None: build_xoauth2_payload(
+                        self._settings.username,
+                        self._settings.password,
+                    ),
+                    initial_response_ok=True,
+                )
+            else:
+                connection.login(self._settings.username, self._settings.password)
+        except Exception:
+            with suppress(Exception):
+                connection.close()
+            raise
         return connection
 
 
@@ -145,7 +170,7 @@ def build_email_message(
     message["Subject"] = subject
     message["Date"] = date_header or formatdate(localtime=True)
     message["Message-ID"] = message_id or make_msgid()
-    message["User-Agent"] = "Mailklient/0.1"
+    message["User-Agent"] = "mcpMail/0.1"
     if in_reply_to:
         _ensure_safe_header("in_reply_to", in_reply_to)
         message["In-Reply-To"] = in_reply_to

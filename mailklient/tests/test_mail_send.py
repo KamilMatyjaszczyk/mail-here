@@ -362,5 +362,5 @@ def test_mail_send_service_forward_uses_original_message_account(tmp_path) -> No
     assert draft.account_id == account.id
     assert draft.recipients == ""
     assert draft.subject == "Fwd: Prosjekt"
-    assert "---------- Videresendt melding ----------" in draft.body_text
+    assert "---------- Forwarded message ----------" in draft.body_text
     assert "Original tekst" in draft.body_text

@@ -1,6 +1,7 @@
 """Application services for the mail client."""
 
 from mailklient.services.demo_data import seed_demo_data
+from mailklient.services.mail_read import MailReadService
 from mailklient.services.mail_send import ComposeDraft, MailSendService, SendResult
 from mailklient.services.mail_sync import (
     CORE_SYNC_FOLDER_NAMES,
@@ -16,6 +17,7 @@ __all__ = [
     "CORE_SYNC_FOLDER_NAMES",
     "HeaderSyncResult",
     "MailSendService",
+    "MailReadService",
     "MailStore",
     "MailSyncService",
     "OAuthLoginService",

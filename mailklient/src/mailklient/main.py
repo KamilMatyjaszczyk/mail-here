@@ -2,34 +2,46 @@
 
 from __future__ import annotations
 
-import os
+import argparse
 import sys
-from pathlib import Path
+from importlib.metadata import version
 
+from PySide6.QtCore import QStandardPaths, QTimer
 from PySide6.QtWidgets import QApplication
 
+from mailklient.config import default_database_path
 from mailklient.services import MailStore, seed_demo_data
 from mailklient.ui.main_window import MainWindow
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     """Start the Qt application."""
-    app = QApplication(sys.argv)
+    parser = argparse.ArgumentParser(description="mcpMail for Linux")
+    parser.add_argument("--version", action="version", version=version("mcpMail"))
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help="Add local sample messages to an empty cache",
+    )
+    args = parser.parse_args(argv)
+    app = QApplication([sys.argv[0]])
+    app.setApplicationDisplayName("mcpMail")
+    # A source/venv install may not have a desktop entry for portal registration.
+    if QStandardPaths.locate(
+        QStandardPaths.StandardLocation.GenericDataLocation,
+        "applications/mailklient.desktop",
+    ):
+        app.setDesktopFileName("mailklient")
 
     store = MailStore(default_database_path())
-    seed_demo_data(store)
+    if args.demo:
+        seed_demo_data(store)
 
     window = MainWindow(store)
     window.show()
+    QTimer.singleShot(0, window.initialize_bridge)
 
     return app.exec()
-
-
-def default_database_path() -> Path:
-    """Return the default local cache path for the application."""
-    data_home = os.environ.get("XDG_DATA_HOME")
-    base_dir = Path(data_home) if data_home else Path.home() / ".local" / "share"
-    return base_dir / "mailklient" / "mailklient.sqlite3"
 
 
 if __name__ == "__main__":

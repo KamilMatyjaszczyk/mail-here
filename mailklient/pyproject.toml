@@ -3,12 +3,13 @@ requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mailklient"
+name = "mcpMail"
 version = "0.1.0"
-description = "En lett og modulær desktop e-postklient for Linux."
+description = "A lightweight, modular desktop email client for Linux."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
+    "IMAPClient>=3.0.1,<4",
     "keyring>=25.0",
     "PySide6>=6.7",
 ]
@@ -16,10 +17,15 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+    "build>=1.2",
 ]
 
 [project.scripts]
+mcpMail = "mailklient.main:main"
+mcpMail-launcher = "mailklient.install_launcher:main"
+# Keep existing terminal commands and shortcuts working after the rename.
 mailklient = "mailklient.main:main"
+mailklient-launcher = "mailklient.install_launcher:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

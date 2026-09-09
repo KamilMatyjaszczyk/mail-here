@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-from html import escape
-from html.parser import HTMLParser
 import os
 import re
+from datetime import datetime
+from html import escape
+from html.parser import HTMLParser
 
-from PySide6.QtCore import Qt, QUrl
-from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import QTextBrowser, QVBoxLayout, QWidget
+from PySide6.QtCore import QEvent, Qt, QUrl
+from PySide6.QtGui import QDesktopServices, QFont, QPalette
+from PySide6.QtWidgets import QFrame, QTextBrowser, QVBoxLayout, QWidget
 
 from mailklient.domain import Attachment, Message
 
@@ -31,6 +32,9 @@ class MessageViewer(QWidget):
         self._plain_text = ""
         self._html = ""
         self._allow_remote_content = False
+        self._message: Message | None = None
+        self._account_label = ""
+        self._attachments: list[Attachment] = []
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -63,6 +67,7 @@ class MessageViewer(QWidget):
             self._viewer.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
             self._viewer.setOpenExternalLinks(False)
             self._viewer.setReadOnly(True)
+            self._viewer.setFrameShape(QFrame.Shape.NoFrame)
             self._viewer.anchorClicked.connect(_open_external_url)
 
         layout.addWidget(self._viewer)
@@ -102,16 +107,19 @@ class MessageViewer(QWidget):
     def set_empty(self) -> None:
         """Show the empty selection state."""
 
-        self._plain_text = "Velg en melding"
+        self._message = None
+        self._attachments = []
+        self._plain_text = "Select a message"
         self._set_html(
             _render_document(
-                title="Velg en melding",
+                title="Select a message",
                 sender="",
                 recipients="",
                 date_text="",
                 account_label="",
-                attachments=[],
-                body_html='<p class="empty-state">Velg en melding</p>',
+                body_html="",
+                palette=self.palette(),
+                font=self.font(),
             )
         )
 
@@ -124,6 +132,9 @@ class MessageViewer(QWidget):
         """Render a selected message."""
 
         attachments = attachments or []
+        self._message = message
+        self._account_label = account_label
+        self._attachments = attachments
         date_text = message.received_at or message.sent_at or ""
         body_text = message.body_text or message.body_preview
         if message.body_html:
@@ -138,11 +149,11 @@ class MessageViewer(QWidget):
 
         self._plain_text = "\n".join(
             [
-                f"Konto: {account_label}",
-                f"Emne: {message.subject}",
-                f"Fra: {message.sender}",
-                f"Til: {message.recipients}",
-                f"Dato: {date_text}",
+                f"Account: {account_label}",
+                f"Subject: {message.subject}",
+                f"From: {message.sender}",
+                f"To: {message.recipients}",
+                f"Date: {date_text}",
                 "",
                 plain_body,
                 "",
@@ -151,15 +162,28 @@ class MessageViewer(QWidget):
         )
         self._set_html(
             _render_document(
-                title=message.subject or "(uten emne)",
+                title=message.subject or "(no subject)",
                 sender=message.sender,
                 recipients=message.recipients,
                 date_text=date_text,
                 account_label=account_label,
-                attachments=attachments,
                 body_html=body_html,
+                palette=self.palette(),
+                font=self.font(),
+                rich_body=bool(message.body_html),
             )
         )
+
+    def changeEvent(self, event: QEvent) -> None:
+        super().changeEvent(event)
+        if event.type() in {
+            QEvent.Type.PaletteChange,
+            QEvent.Type.FontChange,
+        } and hasattr(self, "_viewer"):
+            if self._message is None:
+                self.set_empty()
+            else:
+                self.show_message(self._message, self._account_label, self._attachments)
 
     def _set_html(self, html: str) -> None:
         self._html = html
@@ -187,7 +211,6 @@ if QWebEnginePage is not None:
 
         def createWindow(self, _window_type):
             return _ExternalPopupWebPage(self)
-
 
     class _ExternalPopupWebPage(QWebEnginePage):
         """Route target=_blank windows to the default browser."""
@@ -220,41 +243,56 @@ def _render_document(
     recipients: str,
     date_text: str,
     account_label: str,
-    attachments: list[Attachment],
     body_html: str,
+    palette: QPalette,
+    font: QFont,
+    rich_body: bool = False,
 ) -> str:
     escaped_title = escape(title)
-    escaped_sender = escape(sender or "(ukjent avsender)")
+    escaped_sender = escape(sender or "(unknown sender)")
     escaped_recipients = escape(recipients)
+    try:
+        date = datetime.fromisoformat(date_text)
+        if date.tzinfo is not None:
+            date = date.astimezone()
+        date_text = date.strftime("%Y-%m-%d %H:%M")
+    except ValueError:
+        pass
     escaped_date = escape(date_text)
     escaped_account = escape(account_label)
-    attachments_html = _attachments_html(attachments)
+    background = palette.color(QPalette.ColorRole.Base).name()
+    foreground = palette.color(QPalette.ColorRole.Text).name()
+    divider = palette.color(QPalette.ColorRole.Mid).name()
+    font_family = escape(font.family())
+    font_size = max(12, round(font.pointSizeF() * 96 / 72))
+    body_background = "#ffffff" if rich_body else background
+    body_foreground = "#232629" if rich_body else foreground
     header_details = ""
     if sender or recipients or date_text or account_label:
         header_details = f"""
       <div class="sender-row">
         <div class="sender-block">
           <div class="sender">{escaped_sender}</div>
-          <div class="meta">til {escaped_recipients}</div>
-          <div class="meta">Konto: {escaped_account}</div>
+          <div class="meta">to {escaped_recipients}</div>
+          <div class="meta">Account: {escaped_account}</div>
         </div>
         <div class="date">{escaped_date}</div>
       </div>"""
 
     return f"""<!doctype html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <style>
     :root {{
-      color-scheme: light;
-      font-family: "Noto Sans", "Inter", "Segoe UI", Arial, sans-serif;
+      font-family: "{font_family}", sans-serif;
+      font-size: {font_size}px;
     }}
 
     html,
     body {{
-      background: #fcfcfd;
-      color: #232629;
+      background: {background};
+      color: {foreground};
       margin: 0;
       min-height: 100%;
     }}
@@ -263,21 +301,22 @@ def _render_document(
       box-sizing: border-box;
       margin: 0 auto;
       max-width: 980px;
-      padding: 30px 38px 46px;
+      padding: 20px 22px 28px;
     }}
 
     .app-header {{
-      border-bottom: 1px solid #dfe3ea;
-      margin-bottom: 22px;
-      padding-bottom: 20px;
+      border-bottom: 1px solid {divider};
+      margin-bottom: 16px;
+      padding-bottom: 16px;
     }}
 
     .subject {{
-      color: #232629;
-      font-size: 23px;
+      color: {foreground};
+      font-size: 20px;
       font-weight: 500;
       line-height: 1.35;
-      margin-bottom: 18px;
+      margin-bottom: 14px;
+      overflow-wrap: anywhere;
     }}
 
     .sender-row {{
@@ -299,14 +338,14 @@ def _render_document(
     }}
 
     .meta {{
-      color: #6f7885;
+      color: {foreground};
       font-size: 12px;
       line-height: 1.45;
       overflow-wrap: anywhere;
     }}
 
     .date {{
-      color: #6f7885;
+      color: {foreground};
       display: table-cell;
       font-size: 12px;
       text-align: right;
@@ -316,38 +355,15 @@ def _render_document(
     }}
 
     .email-body {{
-      color: #232629;
-      font-size: 14px;
+      color: {body_foreground};
+      background: {body_background};
+      font-size: {font_size}px;
       line-height: 1.6;
       overflow-wrap: anywhere;
+      box-sizing: border-box;
+      padding: {12 if rich_body else 0}px;
     }}
 
-    .attachments {{
-      border-bottom: 1px solid #dfe3ea;
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      margin: -8px 0 22px;
-      padding-bottom: 18px;
-    }}
-
-    .attachment {{
-      background: #f7f9fc;
-      border: 1px solid #cfd8e3;
-      border-radius: 6px;
-      color: #232629;
-      font-size: 13px;
-      padding: 8px 10px;
-    }}
-
-    .attachment-name {{
-      font-weight: 700;
-      margin-right: 6px;
-    }}
-
-    .attachment-meta {{
-      color: #6f7885;
-    }}
 
     .email-body img {{
       height: auto;
@@ -376,13 +392,19 @@ def _render_document(
     }}
 
     .plain-body {{
-      font-family: "Noto Sans", "Inter", "Segoe UI", Arial, sans-serif;
+      font-family: inherit;
       white-space: pre-wrap;
     }}
 
     .empty-state {{
-      color: #6f7885;
+      color: {foreground};
       margin-top: 24px;
+    }}
+
+    @media (max-width: 600px) {{
+      .message-shell {{ padding: 16px; }}
+      .sender-row, .sender-block, .date {{ display: block; width: auto; }}
+      .date {{ text-align: left; white-space: normal; margin-top: 6px; }}
     }}
   </style>
 </head>
@@ -392,36 +414,16 @@ def _render_document(
       <div class="subject">{escaped_title}</div>
 {header_details}
     </header>
-    {attachments_html}
     <main class="email-body">{body_html}</main>
   </article>
 </body>
 </html>"""
 
 
-def _attachments_html(attachments: list[Attachment]) -> str:
-    if not attachments:
-        return ""
-
-    items = []
-    for attachment in attachments:
-        name = escape(attachment.filename)
-        meta = escape(
-            f"{attachment.content_type}, {_format_size(attachment.size)}"
-        )
-        items.append(
-            '<div class="attachment">'
-            f'<span class="attachment-name">{name}</span>'
-            f'<span class="attachment-meta">{meta}</span>'
-            "</div>"
-        )
-    return '<section class="attachments">' + "".join(items) + "</section>"
-
-
 def _attachments_text(attachments: list[Attachment]) -> str:
     if not attachments:
         return ""
-    lines = ["Vedlegg:"]
+    lines = ["Attachments:"]
     for attachment in attachments:
         lines.append(
             f"- {attachment.filename} ({attachment.content_type}, "
@@ -689,18 +691,14 @@ class _EmailHtmlSanitizer(HTMLParser):
                 for name, value in clean_attrs
                 if name not in {"height", "width"}
             ]
-            classes = [
-                value for name, value in clean_attrs if name == "class"
-            ]
+            classes = [value for name, value in clean_attrs if name == "class"]
             clean_attrs = [
-                (name, value)
-                for name, value in clean_attrs
-                if name != "class"
+                (name, value) for name, value in clean_attrs if name != "class"
             ]
             class_value = " ".join([*classes, "blocked-remote-image"]).strip()
             clean_attrs.append(("class", class_value))
             if not any(name == "alt" for name, _value in clean_attrs):
-                clean_attrs.append(("alt", "Eksternt bilde blokkert"))
+                clean_attrs.append(("alt", "External image blocked"))
 
         if tag == "a" and any(name == "href" for name, _value in clean_attrs):
             clean_attrs = [

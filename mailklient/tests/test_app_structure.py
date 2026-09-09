@@ -32,7 +32,7 @@ from mailklient.services import (
     SendResult,
     seed_demo_data,
 )
-from mailklient.ui import main_window
+from mailklient.ui import attachment_controller, main_window
 from mailklient.ui import message_viewer as message_viewer_module
 from mailklient.ui.main_window import MainWindow
 from mailklient.ui.message_viewer import MessageViewer
@@ -143,7 +143,7 @@ class FakeMailSendService:
         return ComposeDraft(
             account_id=2,
             subject="Fwd: Test",
-            body_text="---------- Videresendt melding ----------",
+            body_text="---------- Forwarded message ----------",
         )
 
 
@@ -151,8 +151,9 @@ class FakeComposeDialog:
     DialogCode = QDialog.DialogCode
     shown_drafts: list[ComposeDraft] = []
 
-    def __init__(self, _accounts, draft: ComposeDraft, _parent=None) -> None:
+    def __init__(self, _accounts, draft: ComposeDraft, _parent=None, **kwargs) -> None:
         self._draft = draft
+        self.draft_id = kwargs.get("draft_id")
         self.shown_drafts.append(draft)
 
     def exec(self):
@@ -174,7 +175,9 @@ def test_main_window_defaults_and_store_backed_layout(tmp_path) -> None:
 
     window = MainWindow(store)
 
-    assert window.windowTitle() == "Mailklient"
+    assert window.windowTitle() == "mcpMail"
+    assert window._preferences.organizationName() == "Mailklient"
+    assert window._preferences.applicationName() == "Mailklient"
     assert window.size().width() == 1200
     assert window.size().height() == 750
 
@@ -196,10 +199,7 @@ def test_main_window_defaults_and_store_backed_layout(tmp_path) -> None:
     compose_action = window.findChild(QAction, "compose_action")
     reply_action = window.findChild(QAction, "reply_action")
     forward_action = window.findChild(QAction, "forward_action")
-    test_imap_button = window.findChild(QPushButton, "test_imap_button")
-    test_smtp_button = window.findChild(QPushButton, "test_smtp_button")
-    oauth_login_button = window.findChild(QPushButton, "oauth_login_button")
-    sync_account_button = window.findChild(QPushButton, "sync_account_button")
+    account_menu_button = window.findChild(QToolButton, "account_menu_button")
     compose_button = window.findChild(QToolButton, "compose_button")
     reply_button = window.findChild(QToolButton, "reply_button")
     forward_button = window.findChild(QToolButton, "forward_button")
@@ -219,36 +219,36 @@ def test_main_window_defaults_and_store_backed_layout(tmp_path) -> None:
     assert compose_action is not None
     assert reply_action is not None
     assert forward_action is not None
-    assert test_imap_button is not None
-    assert test_smtp_button is not None
-    assert oauth_login_button is not None
-    assert sync_account_button is not None
+    assert account_menu_button is not None
+    assert account_menu_button.menu() is window.account_menu
     assert compose_button is not None
     assert reply_button is not None
     assert forward_button is not None
     assert sync_status_label is not None
-    assert not test_imap_button.isEnabled()
-    assert not test_smtp_button.isEnabled()
-    assert not oauth_login_button.isEnabled()
-    assert not sync_account_button.isEnabled()
+    assert not test_imap_action.isEnabled()
+    assert not test_smtp_action.isEnabled()
+    assert not oauth_login_action.isEnabled()
+    assert not sync_account_action.isEnabled()
     assert compose_button.isEnabled()
     assert not reply_button.isEnabled()
     assert not forward_button.isEnabled()
     assert [account_list.item(index).text() for index in range(account_list.count())] == [
-        "Alle innbokser",
+        "All inboxes",
         "Demo",
     ]
     assert [folder_list.item(index).text() for index in range(folder_list.count())] == [
-        "Alle innbokser",
+        "Inbox",
+        "Trash",
+        "Spam",
     ]
     assert message_list.count() == 2
     assert _message_list_item_text(message_list, 0) == (
         "demo@example.com\n"
-        "Velkommen til Mailklient\n"
-        "Dette er lokale demo-data fra SQLite."
+        "Welcome to mcpMail\n"
+        "This is local demo data from SQLite."
     )
     assert message_view.isReadOnly()
-    assert message_view.toPlainText() == "Velg en melding"
+    assert message_view.toPlainText() == "Select a message"
 
     window.close()
 
@@ -357,11 +357,11 @@ def test_main_window_disables_account_actions_without_accounts(tmp_path) -> None
 
     window = MainWindow(store)
 
-    assert not window.findChild(QPushButton, "delete_account_button").isEnabled()
-    assert not window.findChild(QPushButton, "test_imap_button").isEnabled()
-    assert not window.findChild(QPushButton, "test_smtp_button").isEnabled()
-    assert not window.findChild(QPushButton, "oauth_login_button").isEnabled()
-    assert not window.findChild(QPushButton, "sync_account_button").isEnabled()
+    assert not window.findChild(QAction, "delete_account_action").isEnabled()
+    assert not window.findChild(QAction, "test_imap_action").isEnabled()
+    assert not window.findChild(QAction, "test_smtp_action").isEnabled()
+    assert not window.findChild(QAction, "oauth_login_action").isEnabled()
+    assert not window.findChild(QAction, "sync_account_action").isEnabled()
     assert not window.findChild(QToolButton, "compose_button").isEnabled()
 
     window.close()
@@ -382,18 +382,17 @@ def test_main_window_can_add_local_account(tmp_path) -> None:
     assert folder_list is not None
     assert account_list is not None
     assert [account_list.item(index).text() for index in range(account_list.count())] == [
-        "Alle innbokser",
+        "All inboxes",
         "Demo",
         "Privat",
     ]
     assert [folder_list.item(index).text() for index in range(folder_list.count())] == [
-        "Innboks",
-        "Sendt",
-        "Søppelpost",
-        "Papirkurv",
+        "Inbox",
+        "Trash",
+        "Spam",
     ]
     assert account_list.currentItem().text() == "Privat"
-    assert folder_list.currentItem().text() == "Innboks"
+    assert folder_list.currentItem().text() == "Inbox"
 
     window.close()
 
@@ -498,6 +497,7 @@ def test_main_window_does_not_save_password_for_oauth2_account(
         oauth_provider="outlook",
         password="skal-ikke-lagres",
     )
+    _process_events_until(lambda: not window._task_runner.busy)
 
     account = store.list_accounts()[0]
     assert account.auth_method == "oauth2"
@@ -538,7 +538,7 @@ def test_main_window_can_delete_local_account(tmp_path, monkeypatch) -> None:
     assert account_list is not None
     assert folder_list is not None
     assert [account_list.item(index).text() for index in range(account_list.count())] == [
-        "Alle innbokser",
+        "All inboxes",
         "Privat",
     ]
     assert [account.email_address for account in store.list_accounts()] == [
@@ -587,6 +587,7 @@ def test_main_window_can_authorize_existing_oauth_account(
     )
 
     assert window._authorize_selected_oauth_account()
+    _process_events_until(lambda: not window._task_runner.busy)
 
     status_label = window.findChild(QLabel, "sync_status_label")
     assert oauth_login_service.authorized == [("gmail", "client-id", "client-secret")]
@@ -597,7 +598,7 @@ def test_main_window_can_authorize_existing_oauth_account(
         )
     ]
     assert status_label is not None
-    assert status_label.text() == "OAuth innlogging OK"
+    assert status_label.text() == "OAuth sign-in successful"
     assert account.email_address == "privat@example.com"
 
     window.close()
@@ -628,8 +629,8 @@ def test_main_window_shows_selected_message_from_store(tmp_path) -> None:
 
     message_list.setCurrentRow(0)
 
-    assert "Konto: privat@example.com" in message_view.toPlainText()
-    assert "Emne: Fra testen" in message_view.toPlainText()
+    assert "Account: privat@example.com" in message_view.toPlainText()
+    assert "Subject: Fra testen" in message_view.toPlainText()
     assert "Dette er hele e-posten." in message_view.toPlainText()
 
     window.close()
@@ -660,7 +661,7 @@ def test_main_window_renders_html_message_when_available(tmp_path) -> None:
 
     message_list.setCurrentRow(0)
 
-    assert "Konto: privat@example.com" in message_view.toPlainText()
+    assert "Account: privat@example.com" in message_view.toPlainText()
     assert "HTML tittel" in message_view.toPlainText()
     assert "HTML body" in message_view.toPlainText()
 
@@ -864,7 +865,7 @@ def test_main_window_can_save_and_open_cached_attachments(
     store = MailStore(tmp_path / "mailklient.sqlite3")
     account = store.add_account("Privat", "privat@example.com")
     inbox = store.add_folder(account.id, "INBOX")
-    message = store.add_message(account.id, inbox.id, subject="Vedlegg")
+    message = store.add_message(account.id, inbox.id, subject="Attachments")
     store.replace_message_attachments(
         message.id,
         [
@@ -883,12 +884,12 @@ def test_main_window_can_save_and_open_cached_attachments(
     opened_paths: list[str] = []
 
     monkeypatch.setattr(
-        main_window.QFileDialog,
+        attachment_controller.QFileDialog,
         "getSaveFileName",
         lambda *_args, **_kwargs: (str(save_path), ""),
     )
     monkeypatch.setattr(
-        main_window.QDesktopServices,
+        attachment_controller.QDesktopServices,
         "openUrl",
         lambda url: opened_paths.append(url.toLocalFile()) or True,
     )
@@ -916,7 +917,9 @@ def test_main_window_can_save_and_open_cached_attachments(
     assert save_button.isEnabled()
     assert open_button.isEnabled()
     assert window._save_selected_attachment()
+    _process_events_until(lambda: not window._task_runner.busy)
     assert window._open_selected_attachment()
+    _process_events_until(lambda: not window._task_runner.busy)
 
     assert save_path.read_bytes() == b"rapport"
     assert opened_paths
@@ -931,7 +934,7 @@ def test_main_window_can_save_all_cached_attachments(tmp_path, monkeypatch) -> N
     store = MailStore(tmp_path / "mailklient.sqlite3")
     account = store.add_account("Privat", "privat@example.com")
     inbox = store.add_folder(account.id, "INBOX")
-    message = store.add_message(account.id, inbox.id, subject="Vedlegg")
+    message = store.add_message(account.id, inbox.id, subject="Attachments")
     store.replace_message_attachments(
         message.id,
         [
@@ -959,14 +962,14 @@ def test_main_window_can_save_all_cached_attachments(tmp_path, monkeypatch) -> N
     save_dir.mkdir()
 
     monkeypatch.setattr(
-        main_window.QFileDialog,
+        attachment_controller.QFileDialog,
         "getExistingDirectory",
         lambda *_args, **_kwargs: str(save_dir),
     )
 
     window = MainWindow(store)
     message_list = window.findChild(QListWidget, "message_list")
-    save_all_button = window.findChild(QPushButton, "save_all_attachments_button")
+    save_all_button = window.findChild(QToolButton, "save_all_attachments_button")
     status_label = window.findChild(QLabel, "sync_status_label")
 
     assert message_list is not None
@@ -977,9 +980,10 @@ def test_main_window_can_save_all_cached_attachments(tmp_path, monkeypatch) -> N
 
     assert save_all_button.isEnabled()
     assert window._save_all_available_attachments()
+    _process_events_until(lambda: not window._task_runner.busy)
     assert (save_dir / "rapport.txt").read_bytes() == b"rapport"
     assert (save_dir / "rapport (2).txt").read_bytes() == b"kopi"
-    assert status_label.text() == "Lagret 2 vedlegg."
+    assert status_label.text() == "Saved 2 attachments."
 
     window.close()
 
@@ -1015,7 +1019,7 @@ def test_main_window_starts_with_unified_inbox_messages(tmp_path) -> None:
     assert account_list is not None
     assert message_list is not None
     assert message_view is not None
-    assert account_list.currentItem().text() == "Alle innbokser"
+    assert account_list.currentItem().text() == "All inboxes"
     assert [
         _message_list_item_text(message_list, index)
         for index in range(message_list.count())
@@ -1026,8 +1030,8 @@ def test_main_window_starts_with_unified_inbox_messages(tmp_path) -> None:
 
     message_list.setCurrentRow(0)
 
-    assert "Konto: arbeid@example.com" in message_view.toPlainText()
-    assert "Emne: Arbeid" in message_view.toPlainText()
+    assert "Account: arbeid@example.com" in message_view.toPlainText()
+    assert "Subject: Arbeid" in message_view.toPlainText()
 
     window.close()
 
@@ -1110,7 +1114,7 @@ def test_main_window_can_mark_selected_message_read_and_unread(tmp_path) -> None
     message = store.add_message(
         account.id,
         inbox.id,
-        subject="Ulest",
+        subject="Unread",
         sender="sender@example.com",
         is_read=False,
     )
@@ -1130,22 +1134,23 @@ def test_main_window_can_mark_selected_message_read_and_unread(tmp_path) -> None
 
     message_list.setCurrentRow(0)
 
-    selected_item = message_list.currentItem()
-    assert selected_item.font().bold()
+    assert message_list.currentItem().font().bold()
     assert mark_read_button.isEnabled()
     assert mark_unread_button.isEnabled()
 
     assert window._mark_selected_message_read()
+    _process_events_until(lambda: not window._task_runner.busy)
 
     assert store.get_message(message.id).is_read is True
-    assert not selected_item.font().bold()
-    assert status_label.text() == "Melding markert som lest."
+    assert not message_list.currentItem().font().bold()
+    assert status_label.text() == "Message marked as read."
 
     assert window._mark_selected_message_unread()
+    _process_events_until(lambda: not window._task_runner.busy)
 
     assert store.get_message(message.id).is_read is False
-    assert selected_item.font().bold()
-    assert status_label.text() == "Melding markert som ulest."
+    assert message_list.currentItem().font().bold()
+    assert status_label.text() == "Message marked as unread."
 
     window.close()
 
@@ -1167,17 +1172,20 @@ def test_main_window_can_archive_trash_and_move_selected_message(
     monkeypatch.setattr(
         main_window.QInputDialog,
         "getItem",
-        lambda *_args, **_kwargs: ("Søppelpost", True),
+        lambda *_args, **_kwargs: ("Spam", True),
     )
 
     assert message_list is not None
     message_list.setCurrentRow(0)
 
     assert window._archive_selected_message()
+    _process_events_until(lambda: not window._task_runner.busy)
     message_list.setCurrentRow(0)
     assert window._move_selected_message_to_trash()
+    _process_events_until(lambda: not window._task_runner.busy)
     message_list.setCurrentRow(0)
     assert window._move_selected_message()
+    _process_events_until(lambda: not window._task_runner.busy)
 
     assert sync_service.archived_messages == [message.id]
     assert sync_service.trashed_messages == [message.id]
@@ -1242,13 +1250,15 @@ def test_main_window_can_test_selected_account_connections(tmp_path) -> None:
     account_list.setCurrentRow(1)
 
     assert window._test_selected_imap_connection()
+    _process_events_until(lambda: not window._task_runner.busy)
     assert window._test_selected_smtp_connection()
+    _process_events_until(lambda: not window._task_runner.busy)
 
     status_label = window.findChild(QLabel, "sync_status_label")
     assert sync_service.imap_tested_account_id == account.id
     assert sync_service.smtp_tested_account_id == account.id
     assert status_label is not None
-    assert status_label.text() == "SMTP-tilkobling OK"
+    assert status_label.text() == "SMTP connection successful"
 
     window.close()
 
@@ -1272,7 +1282,7 @@ def test_main_window_can_sync_selected_account(tmp_path) -> None:
     _process_events_until(lambda: window._sync_thread is None)
 
     assert sync_service.synced_account_id == account.id
-    assert status_label.text() == "Synkroniserte 2 mapper og 3 meldinger."
+    assert status_label.text() == "Synced 2 folders and 3 messages."
 
     window.close()
 
@@ -1295,6 +1305,6 @@ def test_main_window_reports_partial_sent_copy_failure(tmp_path) -> None:
         )
     )
 
-    assert status_label.text() == "E-post sendt, men serverkopi til Sendt feilet."
+    assert status_label.text() == "Email sent, but saving a server copy in Sent failed."
 
     window.close()

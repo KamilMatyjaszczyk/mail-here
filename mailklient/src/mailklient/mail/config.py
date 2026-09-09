@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 from mailklient.domain import Account
@@ -18,9 +18,12 @@ class ImapSettings:
     host: str
     port: int
     username: str
-    password: str
+    password: str = field(repr=False)
     security: SecurityMode = "ssl"
     auth_method: AuthMethod = "password"
+    local_certificate: str | None = None
+    timeout: float = 30.0
+    password_mechanism: Literal["login", "plain"] = "login"
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,9 +33,11 @@ class SmtpSettings:
     host: str
     port: int
     username: str
-    password: str
+    password: str = field(repr=False)
     security: SecurityMode = "starttls"
     auth_method: AuthMethod = "password"
+    local_certificate: str | None = None
+    timeout: float = 30.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +81,7 @@ class ImapAttachment:
     content_id: str | None = None
     is_inline: bool = False
     content: bytes | None = None
+    imap_section: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +99,10 @@ class ImapMessageHeader:
     body_html: str = ""
     body_preview: str = ""
     attachments: tuple[ImapAttachment, ...] = ()
+    reply_to: str = ""
+    parse_error: bool = False
+    in_reply_to: str = ""
+    references: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +136,12 @@ MAIL_PROVIDER_DEFAULTS = {
 def get_mail_provider_defaults(provider: str) -> MailProviderDefaults:
     """Return default IMAP/SMTP settings for a known provider."""
     return MAIL_PROVIDER_DEFAULTS[provider]
+
+
+def is_personal_outlook_account(account: Account) -> bool:
+    return account.oauth_provider == "outlook" and account.email_address.rsplit("@", 1)[-1].casefold() in {
+        "hotmail.com", "hotmail.no", "outlook.com", "outlook.no", "live.com", "live.no", "msn.com"
+    }
 
 
 def build_mail_account_settings(

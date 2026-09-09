@@ -6,6 +6,8 @@ import sqlite3
 from importlib.resources import files
 from pathlib import Path
 
+from mailklient.database.thread_index import index_message_references
+
 DatabasePath = str | Path
 
 
@@ -30,7 +32,29 @@ def initialize_database(database_path: DatabasePath) -> None:
         _ensure_message_imap_columns(connection)
         _ensure_message_body_columns(connection)
         _ensure_folder_sync_state_table(connection)
+        columns = {row["name"] for row in connection.execute("PRAGMA table_info(folder_sync_state)")}
+        if "uidvalidity" not in columns:
+            connection.execute("ALTER TABLE folder_sync_state ADD COLUMN uidvalidity INTEGER")
         _ensure_attachments_table(connection)
+        _ensure_thread_metadata(connection)
+
+
+def _ensure_thread_metadata(connection: sqlite3.Connection) -> None:
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(messages)")}
+    for name in ("in_reply_to", "references"):
+        if name not in columns:
+            connection.execute(
+                f'ALTER TABLE messages ADD COLUMN "{name}" TEXT NOT NULL DEFAULT \'\''
+            )
+    if connection.execute("SELECT 1 FROM schema_version WHERE version = 2").fetchone():
+        return
+    for row in connection.execute(
+        'SELECT id, message_id, in_reply_to, "references" FROM messages'
+    ):
+        index_message_references(
+            connection, row["id"], row["message_id"], row["in_reply_to"], row["references"]
+        )
+    connection.execute("INSERT INTO schema_version (version) VALUES (2)")
 
 
 def _load_schema() -> str:
@@ -44,6 +68,8 @@ def _ensure_account_server_columns(connection: sqlite3.Connection) -> None:
         row["name"] for row in connection.execute("PRAGMA table_info(accounts)")
     }
     columns = {
+        "provider": "TEXT NOT NULL DEFAULT 'imap'",
+        "local_certificate": "TEXT",
         "auth_method": "TEXT NOT NULL DEFAULT 'password' CHECK (auth_method IN ('password', 'oauth2'))",
         "oauth_provider": "TEXT CHECK (oauth_provider IS NULL OR oauth_provider IN ('gmail', 'outlook'))",
         "username": "TEXT",
@@ -68,6 +94,8 @@ def _ensure_message_imap_columns(connection: sqlite3.Connection) -> None:
     }
     columns = {
         "imap_uid": "TEXT",
+        "message_id": "TEXT",
+        "reply_to": "TEXT NOT NULL DEFAULT ''",
         "flags": "TEXT NOT NULL DEFAULT ''",
     }
 
@@ -85,6 +113,7 @@ def _ensure_message_body_columns(connection: sqlite3.Connection) -> None:
     columns = {
         "body_text": "TEXT NOT NULL DEFAULT ''",
         "body_html": "TEXT NOT NULL DEFAULT ''",
+        "body_fetch_failed": "INTEGER NOT NULL DEFAULT 0 CHECK (body_fetch_failed IN (0, 1))",
     }
 
     for column_name, column_definition in columns.items():
@@ -92,6 +121,17 @@ def _ensure_message_body_columns(connection: sqlite3.Connection) -> None:
             connection.execute(
                 f"ALTER TABLE messages ADD COLUMN {column_name} {column_definition}"
             )
+
+    if "body_fetch_failed" not in existing_columns:
+        # Older versions stored these placeholders without remembering the failure.
+        connection.execute(
+            "UPDATE messages SET body_fetch_failed = 1 "
+            "WHERE body_html = '' AND body_text IN (?, ?)",
+            (
+                "Meldingsinnholdet kunne ikke hentes. Prøv i webmail.",
+                "Denne meldingen har ugyldig innhold. Åpne den i webmail.",
+            ),
+        )
 
 
 def _ensure_folder_sync_state_table(connection: sqlite3.Connection) -> None:
@@ -134,6 +174,10 @@ def _ensure_attachments_table(connection: sqlite3.Connection) -> None:
     }
     if "content" not in existing_columns:
         connection.execute("ALTER TABLE attachments ADD COLUMN content BLOB")
+    if "imap_section" not in existing_columns:
+        connection.execute("ALTER TABLE attachments ADD COLUMN imap_section TEXT")
+    if "accessed_at" not in existing_columns:
+        connection.execute("ALTER TABLE attachments ADD COLUMN accessed_at TEXT")
     connection.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_attachments_message_id

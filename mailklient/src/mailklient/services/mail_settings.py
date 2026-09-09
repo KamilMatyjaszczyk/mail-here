@@ -2,8 +2,16 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+from pathlib import Path
+
 from mailklient.domain import Account
-from mailklient.mail.config import MailAccountSettings, build_mail_account_settings
+from mailklient.mail.config import (
+    MailAccountSettings,
+    build_mail_account_settings,
+    is_personal_outlook_account,
+)
+from mailklient.mail.tuta_bridge import build_tuta_bridge_settings
 from mailklient.security import (
     OAuthCallbackError,
     OAuthClientConfigError,
@@ -29,7 +37,32 @@ def get_mail_account_settings(
         return None
 
     secret = _get_account_secret(account)
-    return build_mail_account_settings(account, secret)
+    if account.provider == "tuta":
+        if not secret:
+            raise ValueError("Tuta bridge password is missing from keyring.")
+        if (
+            account.auth_method != "password"
+            or account.imap_host != "127.0.0.1"
+            or account.smtp_host != "127.0.0.1"
+        ):
+            raise ValueError("Tuta accounts require a local bridge and password login.")
+        imap, smtp = build_tuta_bridge_settings(
+            account.email_address,
+            secret,
+            Path(account.local_certificate) if account.local_certificate else None,
+            imap_auth="plain",
+        )
+        return MailAccountSettings(account.id, account.email_address, imap, smtp)
+    settings = build_mail_account_settings(account, secret)
+    if (
+        settings is not None
+        and is_personal_outlook_account(account)
+        and settings.smtp.host.casefold() == "smtp.office365.com"
+    ):
+        settings = replace(
+            settings, smtp=replace(settings.smtp, host="smtp-mail.outlook.com")
+        )
+    return settings
 
 
 def _get_account_secret(account: Account) -> str | None:

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtGui import QFont
+from PySide6.QtCore import QTimer
+from PySide6.QtGui import QFont, QIcon
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -12,8 +13,10 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
+    QLabel,
     QLineEdit,
     QListWidget,
+    QMessageBox,
     QPushButton,
     QTextEdit,
     QVBoxLayout,
@@ -21,6 +24,7 @@ from PySide6.QtWidgets import (
 
 from mailklient.domain import Account
 from mailklient.services import ComposeDraft
+from mailklient.services.drafts import DraftService
 
 
 class ComposeDialog(QDialog):
@@ -31,9 +35,16 @@ class ComposeDialog(QDialog):
         accounts: list[Account],
         draft: ComposeDraft,
         parent=None,
+        *,
+        draft_service: DraftService | None = None,
+        draft_id: int | None = None,
+        uncertain: bool = False,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Ny e-post")
+        self._draft_service = draft_service
+        self.draft_id = draft_id
+        self._uncertain = uncertain
+        self.setWindowTitle("New email")
         self.resize(720, 560)
         self.setStyleSheet(_COMPOSE_DIALOG_STYLESHEET)
 
@@ -48,7 +59,7 @@ class ComposeDialog(QDialog):
 
         self.recipients_edit = QLineEdit(draft.recipients)
         self.recipients_edit.setObjectName("compose_recipients_edit")
-        self.recipients_edit.setPlaceholderText("mottaker@example.com")
+        self.recipients_edit.setPlaceholderText("recipient@example.com")
 
         self.cc_edit = QLineEdit(draft.cc)
         self.cc_edit.setObjectName("compose_cc_edit")
@@ -71,21 +82,21 @@ class ComposeDialog(QDialog):
         self.bold_button.setObjectName("compose_bold_button")
         self.bold_button.setCheckable(True)
         self.bold_button.setFixedWidth(36)
-        self.bold_button.setToolTip("Fet")
+        self.bold_button.setToolTip("Bold")
         self.bold_button.clicked.connect(self._toggle_bold)
 
         self.italic_button = QPushButton("I")
         self.italic_button.setObjectName("compose_italic_button")
         self.italic_button.setCheckable(True)
         self.italic_button.setFixedWidth(36)
-        self.italic_button.setToolTip("Kursiv")
+        self.italic_button.setToolTip("Italic")
         self.italic_button.clicked.connect(self._toggle_italic)
 
         self.underline_button = QPushButton("U")
         self.underline_button.setObjectName("compose_underline_button")
         self.underline_button.setCheckable(True)
         self.underline_button.setFixedWidth(36)
-        self.underline_button.setToolTip("Understreking")
+        self.underline_button.setToolTip("Underline")
         self.underline_button.clicked.connect(self._toggle_underline)
 
         format_layout = QHBoxLayout()
@@ -98,11 +109,11 @@ class ComposeDialog(QDialog):
         self.attachment_list.setObjectName("compose_attachment_list")
         self.attachment_list.setMaximumHeight(90)
 
-        self.add_attachment_button = QPushButton("Legg ved...")
+        self.add_attachment_button = QPushButton("Attach...")
         self.add_attachment_button.setObjectName("compose_add_attachment_button")
         self.add_attachment_button.clicked.connect(self._add_attachments)
 
-        self.remove_attachment_button = QPushButton("Fjern valgt")
+        self.remove_attachment_button = QPushButton("Remove selected")
         self.remove_attachment_button.setObjectName("compose_remove_attachment_button")
         self.remove_attachment_button.clicked.connect(self._remove_selected_attachment)
 
@@ -115,20 +126,27 @@ class ComposeDialog(QDialog):
         self._reload_attachment_list()
 
         form_layout = QFormLayout()
-        form_layout.addRow("Fra", self.account_combo)
-        form_layout.addRow("Til", self.recipients_edit)
+        form_layout.addRow("From", self.account_combo)
+        form_layout.addRow("To", self.recipients_edit)
         form_layout.addRow("Cc", self.cc_edit)
         form_layout.addRow("Bcc", self.bcc_edit)
-        form_layout.addRow("Emne", self.subject_edit)
+        form_layout.addRow("Subject", self.subject_edit)
 
         buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Cancel
-            | QDialogButtonBox.StandardButton.Ok
+            QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok
         )
         buttons.setObjectName("compose_button_box")
         buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Send")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
+        if draft_service is not None:
+            save_button = buttons.addButton(
+                "Save draft", QDialogButtonBox.ButtonRole.ActionRole
+            )
+            save_button.setIcon(QIcon.fromTheme("document-save"))
+            save_button.clicked.connect(self._save_draft)
+            buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Close")
+        self.save_status = QLabel()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 18, 18, 18)
@@ -139,8 +157,60 @@ class ComposeDialog(QDialog):
         layout.addWidget(self.attachment_list)
         layout.addLayout(attachment_button_layout)
         layout.addWidget(buttons)
+        layout.addWidget(self.save_status)
 
         self._in_reply_to = draft.in_reply_to
+        self._autosave = QTimer(self)
+        self._autosave.setInterval(2000)
+        self._autosave.setSingleShot(True)
+        self._autosave.timeout.connect(self._save_draft)
+        for edit in (
+            self.recipients_edit,
+            self.cc_edit,
+            self.bcc_edit,
+            self.subject_edit,
+            self.body_edit,
+        ):
+            edit.textChanged.connect(lambda *_args: self._autosave.start())
+        self.account_combo.currentIndexChanged.connect(lambda: self._autosave.start())
+
+    def _save_draft(self) -> bool:
+        if self._draft_service is None:
+            return True
+        try:
+            self.draft_id = self._draft_service.save(self.draft(), self.draft_id)
+            self._attachment_paths = list(
+                self._draft_service.get(self.draft_id).draft.attachment_paths
+            )
+            self._reload_attachment_list(autosave=False)
+        except Exception:
+            self.save_status.setText("Could not save draft. Keep this window open.")
+            return False
+        self.save_status.setText("Draft saved locally")
+        return True
+
+    def accept(self) -> None:
+        if not self.recipients_edit.text().strip():
+            self.save_status.setText("Enter at least one recipient.")
+            return
+        if (
+            self._uncertain
+            and QMessageBox.question(
+                self,
+                "Check Sent",
+                "The previous send has an unknown outcome. Have you checked Sent and do you want to send this draft again?",
+            )
+            != QMessageBox.StandardButton.Yes
+        ):
+            return
+        if self._save_draft():
+            self._autosave.stop()
+            super().accept()
+
+    def reject(self) -> None:
+        if self._save_draft():
+            self._autosave.stop()
+            super().reject()
 
     def draft(self) -> ComposeDraft:
         """Return the current compose form as draft data."""
@@ -157,7 +227,9 @@ class ComposeDialog(QDialog):
         )
 
     def _toggle_bold(self) -> None:
-        weight = QFont.Weight.Bold if self.bold_button.isChecked() else QFont.Weight.Normal
+        weight = (
+            QFont.Weight.Bold if self.bold_button.isChecked() else QFont.Weight.Normal
+        )
         self.body_edit.setFontWeight(weight)
 
     def _toggle_italic(self) -> None:
@@ -169,7 +241,7 @@ class ComposeDialog(QDialog):
     def _add_attachments(self) -> None:
         paths, _selected_filter = QFileDialog.getOpenFileNames(
             self,
-            "Legg ved filer",
+            "Attach files",
         )
         for path in paths:
             if path not in self._attachment_paths:
@@ -185,10 +257,12 @@ class ComposeDialog(QDialog):
             del self._attachment_paths[row]
         self._reload_attachment_list()
 
-    def _reload_attachment_list(self) -> None:
+    def _reload_attachment_list(self, *, autosave: bool = True) -> None:
         self.attachment_list.clear()
         for path in self._attachment_paths:
             self.attachment_list.addItem(Path(path).name)
+        if autosave and hasattr(self, "_autosave"):
+            self._autosave.start()
 
 
 _COMPOSE_DIALOG_STYLESHEET = """

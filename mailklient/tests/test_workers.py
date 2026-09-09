@@ -30,6 +30,7 @@ class FakeMailSyncService:
         limit_per_folder: int,
         folder_names: tuple[str, ...] | None,
         message_folder_names: tuple[str, ...] | None,
+        progress=None,
     ) -> HeaderSyncResult:
         self.calls.append(
             (account_id, limit_per_folder, folder_names, message_folder_names)
@@ -63,7 +64,7 @@ def test_mail_sync_worker_emits_result() -> None:
     results: list[tuple[int, HeaderSyncResult]] = []
     done: list[bool] = []
 
-    worker.finished.connect(
+    worker.synced.connect(
         lambda account_id, result: results.append((account_id, result))
     )
     worker.done.connect(lambda: done.append(True))

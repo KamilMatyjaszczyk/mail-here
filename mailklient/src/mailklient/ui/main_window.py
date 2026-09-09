@@ -3,40 +3,49 @@
 from __future__ import annotations
 
 import sqlite3
-import smtplib
-import tempfile
-import base64
-import re
+from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QPoint, QSize, QThread, QTimer, Qt, QUrl
-from PySide6.QtGui import QAction, QCursor, QDesktopServices, QFont, QIcon
+from PySide6.QtCore import (
+    QEvent,
+    QObject,
+    QPoint,
+    QSettings,
+    QSize,
+    Qt,
+    QThread,
+    QTimer,
+)
+from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (
-    QApplication,
     QCheckBox,
     QComboBox,
-    QFileDialog,
+    QDialog,
+    QDialogButtonBox,
+    QHBoxLayout,
     QInputDialog,
     QLabel,
-    QHBoxLayout,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
-    QLineEdit,
     QSizePolicy,
     QSplitter,
+    QStyle,
     QTextBrowser,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
-from mailklient.domain import Attachment, Message
-from mailklient.mail import get_mail_provider_defaults
+from mailklient.domain import Account, Attachment, Message
+from mailklient.domain.errors import MailReadError
+from mailklient.domain.mail_queries import EmailFilters
+from mailklient.install_launcher import install_launcher
 from mailklient.security import (
-    OAuthCallbackError,
     OAuthClientConfigError,
     delete_oauth_tokens,
     delete_password,
@@ -45,6 +54,7 @@ from mailklient.security import (
     save_oauth_tokens,
     save_password,
 )
+from mailklient.security.attachment_files import AttachmentWorkspace
 from mailklient.services import (
     ComposeDraft,
     HeaderSyncResult,
@@ -54,84 +64,45 @@ from mailklient.services import (
     OAuthLoginService,
     SendResult,
 )
+from mailklient.services.account_settings import AccountSettingsService
+from mailklient.services.attachments import AttachmentService
+from mailklient.services.bridge_runtime import BridgeRuntimeService, BridgeStatus
+from mailklient.services.drafts import DraftService
+from mailklient.services.mail_read import MAX_PAGE_SIZE, MailReadService
+from mailklient.services.tuta_setup import TutaSetupService
 from mailklient.ui.account_dialog import AccountDialog
+from mailklient.ui.attachment_controller import AttachmentController
+from mailklient.ui.columns import (
+    DEFAULT_COLUMN_ORDER,
+    ColumnDragHandle,
+    ColumnLayoutController,
+)
 from mailklient.ui.compose_dialog import ComposeDialog
+from mailklient.ui.draft_dialog import DraftDialog
 from mailklient.ui.message_viewer import MessageViewer
+from mailklient.ui.oauth_settings_dialog import OAuthSettingsDialog
+from mailklient.ui.presentation import (
+    ElidedLabel,
+    _apply_provider_defaults,
+    _compact_message_item_text,
+    _configure_message_item,
+    _folder_display_name,
+    _folder_labels,
+    _friendly_error_message,
+    _is_core_folder,
+    _message_sender_label,
+    _send_status_text,
+    _short_message_date,
+    _toolbar_button,
+)
+from mailklient.ui.theme import _MAIN_WINDOW_STYLESHEET
 from mailklient.workers import MailSendWorker, MailSyncWorker
+from mailklient.workers.bridge_worker import BridgeWorker
+from mailklient.workers.task_runner import TaskRunner
+from mailklient.workers.tuta_setup_worker import TutaSetupWorker
 
 UNIFIED_INBOX_ROLE = "unified_inbox"
 MESSAGE_TEXT_ROLE = Qt.ItemDataRole.UserRole + 1
-DEFAULT_COLUMN_ORDER = ("folders", "reader", "messages")
-COLUMN_WIDTHS = {
-    "folders": 230,
-    "reader": 610,
-    "messages": 360,
-}
-COLUMN_TITLES = {
-    "folders": "Kontoer og mapper",
-    "reader": "Mail",
-    "messages": "Meldinger",
-}
-
-
-class ColumnDragHandle(QLabel):
-    """Small drag handle used to reorder the main columns."""
-
-    def __init__(self, title: str, column_name: str, window: "MainWindow") -> None:
-        super().__init__(f":: {title}")
-        self._column_name = column_name
-        self._window = window
-        self._press_position: QPoint | None = None
-        self._dragging = False
-        self.setObjectName(f"column_drag_handle_{column_name}")
-        self.setCursor(QCursor(Qt.CursorShape.OpenHandCursor))
-        self.setToolTip("Dra for å flytte kolonnen")
-        self.setFixedHeight(40)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-
-    def mousePressEvent(self, event: object) -> None:
-        if _event_button(event) != Qt.MouseButton.LeftButton:
-            return super().mousePressEvent(event)
-        self._press_position = _event_position(event)
-        self._dragging = False
-        self._window._begin_column_drag(self._column_name)
-        self.setProperty("dragging", True)
-        self.style().unpolish(self)
-        self.style().polish(self)
-        self.setCursor(QCursor(Qt.CursorShape.ClosedHandCursor))
-        if hasattr(event, "accept"):
-            event.accept()
-
-    def mouseMoveEvent(self, event: object) -> None:
-        if self._press_position is None:
-            return super().mouseMoveEvent(event)
-        distance = (_event_position(event) - self._press_position).manhattanLength()
-        if distance >= QApplication.startDragDistance():
-            self._dragging = True
-            self._window._preview_column_drop(
-                self._column_name,
-                _event_global_position(event),
-            )
-        if hasattr(event, "accept"):
-            event.accept()
-
-    def mouseReleaseEvent(self, event: object) -> None:
-        if self._press_position is None:
-            return super().mouseReleaseEvent(event)
-        global_position = _event_global_position(event)
-        self._window._finish_column_drag(
-            self._column_name,
-            global_position,
-            commit=self._dragging,
-        )
-        self._press_position = None
-        self._dragging = False
-        self.setProperty("dragging", False)
-        self.style().unpolish(self)
-        self.style().polish(self)
-        self.setCursor(QCursor(Qt.CursorShape.OpenHandCursor))
-        if hasattr(event, "accept"):
-            event.accept()
 
 
 class MainWindow(QMainWindow):
@@ -143,12 +114,33 @@ class MainWindow(QMainWindow):
         mail_sync_service: MailSyncService | None = None,
         mail_send_service: MailSendService | None = None,
         oauth_login_service: OAuthLoginService | None = None,
+        bridge_runtime_service: BridgeRuntimeService | None = None,
+        preferences: QSettings | None = None,
     ) -> None:
         super().__init__()
         self._mail_store = mail_store
+        self._mail_reader = MailReadService(mail_store.database_path)
+        self._layout_controller = ColumnLayoutController(self)
+        self._attachment_controller = AttachmentController(self)
+        self._task_runner = TaskRunner(self)
+        self._task_runner.busyChanged.connect(self._refresh_busy_actions)
+        self._pending_attachment_preview: int | None = None
+        self._attachment_service = AttachmentService(mail_store)
+        self._attachment_files = AttachmentWorkspace()
+        self._draft_service = DraftService(mail_store)
+        self._sending_draft_id: int | None = None
+        self._sync_queue: list[int] = []
+        self._manual_sync_batch = False
+        self._sync_queue_failures: list[str] = []
+        self._background_sync = False
         self._mail_sync_service = mail_sync_service or MailSyncService(mail_store)
         self._mail_send_service = mail_send_service or MailSendService(mail_store)
         self._oauth_login_service = oauth_login_service or OAuthLoginService()
+        self._bridge_runtime_service = bridge_runtime_service or BridgeRuntimeService()
+        # Preserve saved layouts and preferences across the mcpMail rename.
+        self._preferences = preferences or QSettings("Mailklient", "Mailklient")
+        self._bridge_thread: QThread | None = None
+        self._bridge_worker: BridgeWorker | None = None
         self._messages_by_id: dict[int, Message] = {}
         self._current_messages: list[Message] = []
         self._current_folder_is_unified = False
@@ -156,6 +148,10 @@ class MainWindow(QMainWindow):
         self._sync_in_progress = False
         self._sync_thread: QThread | None = None
         self._sync_worker: MailSyncWorker | None = None
+        self._sync_account_id: int | None = None
+        self._sync_account_label = ""
+        self._tuta_setup_thread: QThread | None = None
+        self._tuta_setup_worker: TutaSetupWorker | None = None
         self._send_in_progress = False
         self._send_thread: QThread | None = None
         self._send_worker: MailSendWorker | None = None
@@ -165,97 +161,227 @@ class MainWindow(QMainWindow):
         self._drag_source_column: str | None = None
         self._drop_preview: tuple[str, bool] | None = None
         self._message_toolbar_mode = "compact"
+        self._refreshing_theme = False
 
-        self.setWindowTitle("Mailklient")
+        self.setWindowTitle("mcpMail")
         self.resize(1200, 750)
         self.setStyleSheet(_MAIN_WINDOW_STYLESHEET)
 
+        self._editing_account = False
         self._build_menu()
         self.setCentralWidget(self._build_central_widget())
         self.folder_list.currentItemChanged.connect(self._load_selected_folder)
         self.account_list.currentItemChanged.connect(self._load_selected_account)
         self.message_list.currentItemChanged.connect(self._show_selected_message)
         self._load_accounts()
+        self.bridge_status_label = QLabel("Tuta: not checked")
+        self.bridge_status_label.setVisible(
+            any(
+                account.provider == "tuta"
+                for account in self._mail_store.list_accounts()
+            )
+        )
+        self.statusBar().addPermanentWidget(self.bridge_status_label)
+        self._sync_timer = QTimer(self)
+        self._sync_timer.setInterval(180000)
+        self._sync_timer.timeout.connect(self._queue_auto_sync)
+        if self.auto_sync_action.isChecked():
+            self._sync_timer.start()
 
     def resizeEvent(self, event: object) -> None:
         super().resizeEvent(event)
         self._update_message_toolbar_layout()
 
-    def eventFilter(self, watched: object, event: object) -> bool:
+    def closeEvent(self, event) -> None:
+        if (
+            self._task_runner.busy
+            or self._manual_sync_batch
+            or self._sync_queue
+            or any(
+                thread is not None and thread.isRunning()
+                for thread in (
+                    self._tuta_setup_thread,
+                    self._sync_thread,
+                    self._send_thread,
+                    self._bridge_thread,
+                )
+            )
+        ):
+            self.sync_status_label.setText(
+                "Wait for the current operation to finish before closing."
+            )
+            event.ignore()
+            return
+        self._attachment_files.close()
+        self.attachment_dialog.close()
+        if hasattr(self._mail_send_service, "close"):
+            self._mail_send_service.close()
+        super().closeEvent(event)
+
+    def changeEvent(self, event: QEvent) -> None:
+        super().changeEvent(event)
+        if (
+            event.type()
+            in {QEvent.Type.PaletteChange, QEvent.Type.ApplicationPaletteChange}
+            and hasattr(self, "message_view")
+            and not self._refreshing_theme
+        ):
+            # Qt resolves palette() rules when polishing the stylesheet.
+            self._refreshing_theme = True
+            try:
+                self.setStyleSheet(_MAIN_WINDOW_STYLESHEET)
+            finally:
+                self._refreshing_theme = False
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         if (
             hasattr(self, "message_toolbar")
             and watched is self.message_toolbar
-            and getattr(event, "type")() == QEvent.Type.Resize
+            and event.type() == QEvent.Type.Resize
         ):
             QTimer.singleShot(0, self._update_message_toolbar_layout)
         return super().eventFilter(watched, event)
 
     def _build_menu(self) -> None:
-        account_menu = self.menuBar().addMenu("Konto")
+        account_menu = self.menuBar().addMenu("Account")
+        self.account_menu = account_menu
+        account_menu.setObjectName("account_menu")
 
-        add_account_action = QAction("Legg til konto", self)
-        add_account_action.setObjectName("add_account_action")
-        add_account_action.triggered.connect(self._open_add_account_dialog)
+        self.add_account_action = QAction("Add account", self)
+        self.add_account_action.setObjectName("add_account_action")
+        self.add_account_action.triggered.connect(self._open_add_account_dialog)
 
-        delete_account_action = QAction("Slett konto", self)
-        delete_account_action.setObjectName("delete_account_action")
-        delete_account_action.triggered.connect(self._delete_selected_account)
+        self.edit_account_action = QAction("Edit account", self)
+        self.edit_account_action.setObjectName("edit_account_action")
+        self.edit_account_action.triggered.connect(self._open_edit_account_dialog)
 
-        test_imap_action = QAction("Test IMAP", self)
-        test_imap_action.setObjectName("test_imap_action")
-        test_imap_action.triggered.connect(self._test_selected_imap_connection)
+        self.delete_account_action = QAction("Delete account", self)
+        self.delete_account_action.setObjectName("delete_account_action")
+        self.delete_account_action.triggered.connect(self._delete_selected_account)
 
-        test_smtp_action = QAction("Test SMTP", self)
-        test_smtp_action.setObjectName("test_smtp_action")
-        test_smtp_action.triggered.connect(self._test_selected_smtp_connection)
+        self.test_imap_action = QAction("Test IMAP", self)
+        self.test_imap_action.setObjectName("test_imap_action")
+        self.test_imap_action.triggered.connect(self._test_selected_imap_connection)
 
-        oauth_login_action = QAction("OAuth login", self)
-        oauth_login_action.setObjectName("oauth_login_action")
-        oauth_login_action.triggered.connect(self._authorize_selected_oauth_account)
+        self.test_smtp_action = QAction("Test SMTP", self)
+        self.test_smtp_action.setObjectName("test_smtp_action")
+        self.test_smtp_action.triggered.connect(self._test_selected_smtp_connection)
 
-        self.sync_account_action = QAction("Synk konto", self)
+        self.oauth_login_action = QAction("Sign in with OAuth", self)
+        self.oauth_login_action.setObjectName("oauth_login_action")
+        self.oauth_login_action.triggered.connect(
+            self._authorize_selected_oauth_account
+        )
+
+        self.sync_account_action = QAction("Sync account", self)
         self.sync_account_action.setObjectName("sync_account_action")
         self.sync_account_action.triggered.connect(self._sync_selected_account)
 
-        account_menu.addAction(add_account_action)
-        account_menu.addAction(delete_account_action)
-        account_menu.addSeparator()
-        account_menu.addAction(test_imap_action)
-        account_menu.addAction(test_smtp_action)
-        account_menu.addAction(oauth_login_action)
         account_menu.addAction(self.sync_account_action)
+        self.cancel_sync_action = QAction(
+            QIcon.fromTheme("process-stop"), "Cancel sync", self
+        )
+        self.cancel_sync_action.setObjectName("cancel_sync_action")
+        self.cancel_sync_action.setEnabled(False)
+        self.cancel_sync_action.triggered.connect(self._cancel_sync)
+        account_menu.addAction(self.cancel_sync_action)
+        self.fetch_older_action = QAction("Fetch older messages", self)
+        self.fetch_older_action.triggered.connect(self._fetch_older_messages)
+        account_menu.addAction(self.fetch_older_action)
+        self.auto_sync_action = QAction("Automatically sync every 3 minutes", self)
+        self.auto_sync_action.setCheckable(True)
+        self.auto_sync_action.setChecked(
+            self._preferences.value("sync/automatic", True, type=bool)
+        )
+        self.auto_sync_action.toggled.connect(self._toggle_auto_sync)
+        account_menu.addAction(self.auto_sync_action)
+        account_menu.addSeparator()
+        account_menu.addAction(self.add_account_action)
+        account_menu.addAction(self.edit_account_action)
+        account_menu.addAction(self.delete_account_action)
+        account_menu.addSeparator()
+        account_menu.addAction(self.oauth_login_action)
+        account_menu.addAction(self.test_imap_action)
+        account_menu.addAction(self.test_smtp_action)
+        account_menu.addSeparator()
+        self.oauth_settings_action = QAction("OAuth app settings", self)
+        self.oauth_settings_action.triggered.connect(self._open_oauth_settings)
+        account_menu.addAction(self.oauth_settings_action)
+        launcher_action = QAction("Add to application menu", self)
+        launcher_action.triggered.connect(
+            lambda: self._start_task(
+                "Creating shortcut...",
+                install_launcher,
+                lambda _path: self.sync_status_label.setText(
+                    "mcpMail added to the application menu."
+                ),
+            )
+        )
+        account_menu.addAction(launcher_action)
+        self.clear_attachment_cache_action = QAction("Clear attachment cache...", self)
+        self.clear_attachment_cache_action.triggered.connect(
+            self._clear_attachment_cache
+        )
+        account_menu.addAction(self.clear_attachment_cache_action)
 
-        message_menu = self.menuBar().addMenu("Melding")
+        bridge_menu = account_menu.addMenu("TutaBridge")
+        self.bridge_start_action = QAction(
+            QIcon.fromTheme("media-playback-start"), "Start TutaBridge", self
+        )
+        self.bridge_start_action.triggered.connect(
+            lambda: self._run_bridge_check(start=True)
+        )
+        self.bridge_check_action = QAction(
+            QIcon.fromTheme("view-refresh"), "Check status", self
+        )
+        self.bridge_check_action.triggered.connect(lambda: self._run_bridge_check())
+        self.bridge_autostart_action = QAction("Start with mcpMail", self)
+        self.bridge_autostart_action.setCheckable(True)
+        self.bridge_autostart_action.setChecked(
+            self._preferences.value("tuta/autostart", False, type=bool)
+        )
+        self.bridge_autostart_action.toggled.connect(
+            lambda enabled: self._preferences.setValue("tuta/autostart", enabled)
+        )
+        bridge_menu.addAction(self.bridge_start_action)
+        bridge_menu.addAction(self.bridge_check_action)
+        bridge_menu.addSeparator()
+        bridge_menu.addAction(self.bridge_autostart_action)
 
-        self.compose_action = QAction("Ny e-post", self)
+        message_menu = self.menuBar().addMenu("Message")
+        drafts_action = QAction(QIcon.fromTheme("document-open"), "Drafts", self)
+        drafts_action.triggered.connect(self._open_saved_drafts)
+        message_menu.addAction(drafts_action)
+
+        self.compose_action = QAction("New email", self)
         self.compose_action.setObjectName("compose_action")
         self.compose_action.triggered.connect(self._open_new_message_dialog)
 
-        self.reply_action = QAction("Svar", self)
+        self.reply_action = QAction("Reply", self)
         self.reply_action.setObjectName("reply_action")
         self.reply_action.triggered.connect(self._reply_to_selected_message)
 
-        self.forward_action = QAction("Videresend", self)
+        self.forward_action = QAction("Forward", self)
         self.forward_action.setObjectName("forward_action")
         self.forward_action.triggered.connect(self._forward_selected_message)
 
-        self.mark_read_action = QAction("Marker som lest", self)
+        self.mark_read_action = QAction("Mark as read", self)
         self.mark_read_action.setObjectName("mark_read_action")
         self.mark_read_action.triggered.connect(self._mark_selected_message_read)
 
-        self.mark_unread_action = QAction("Marker som ulest", self)
+        self.mark_unread_action = QAction("Mark as unread", self)
         self.mark_unread_action.setObjectName("mark_unread_action")
         self.mark_unread_action.triggered.connect(self._mark_selected_message_unread)
 
-        self.archive_action = QAction("Arkiver", self)
+        self.archive_action = QAction("Archive", self)
         self.archive_action.setObjectName("archive_action")
         self.archive_action.triggered.connect(self._archive_selected_message)
 
-        self.trash_action = QAction("Flytt til søppel", self)
+        self.trash_action = QAction("Move to trash", self)
         self.trash_action.setObjectName("trash_action")
         self.trash_action.triggered.connect(self._move_selected_message_to_trash)
 
-        self.move_action = QAction("Flytt...", self)
+        self.move_action = QAction("Move...", self)
         self.move_action.setObjectName("move_action")
         self.move_action.triggered.connect(self._move_selected_message)
 
@@ -296,91 +422,64 @@ class MainWindow(QMainWindow):
         panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
 
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(10)
+        layout.setContentsMargins(8, 6, 8, 8)
+        layout.setSpacing(6)
 
         layout.addWidget(self._build_column_drag_handle("folders"))
 
-        app_title = QLabel("Mailklient")
-        app_title.setObjectName("app_title")
-
-        title = QLabel("Mapper")
+        title = QLabel("Folders")
         title.setObjectName("folder_panel_title")
 
-        account_title = QLabel("Kontoer")
+        account_title = QLabel("Accounts")
         account_title.setObjectName("account_panel_title")
 
         self.account_list = QListWidget()
         self.account_list.setObjectName("account_list")
-        self.account_list.setMaximumHeight(128)
-        self.account_list.setVerticalScrollBarPolicy(
+        self.account_list.itemDoubleClicked.connect(
+            lambda _item: self._open_edit_account_dialog()
+        )
+        self.account_list.setMaximumHeight(180)
+        self.account_list.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
+        self.account_list.setTextElideMode(Qt.TextElideMode.ElideRight)
 
-        self.add_account_button = QPushButton("Legg til")
-        self.add_account_button.setObjectName("add_account_button")
-        self.add_account_button.clicked.connect(self._open_add_account_dialog)
-
-        self.delete_account_button = QPushButton("Slett konto")
-        self.delete_account_button.setObjectName("delete_account_button")
-        self.delete_account_button.clicked.connect(self._delete_selected_account)
-
-        self.test_imap_button = QPushButton("Test IMAP")
-        self.test_imap_button.setObjectName("test_imap_button")
-        self.test_imap_button.clicked.connect(self._test_selected_imap_connection)
-
-        self.test_smtp_button = QPushButton("Test SMTP")
-        self.test_smtp_button.setObjectName("test_smtp_button")
-        self.test_smtp_button.clicked.connect(self._test_selected_smtp_connection)
-
-        self.oauth_login_button = QPushButton("OAuth")
-        self.oauth_login_button.setObjectName("oauth_login_button")
-        self.oauth_login_button.clicked.connect(self._authorize_selected_oauth_account)
-
-        self.sync_account_button = QPushButton("Synk")
-        self.sync_account_button.setObjectName("sync_account_button")
-        self.sync_account_button.clicked.connect(self._sync_selected_account)
-
-        account_button_layout = QHBoxLayout()
-        account_button_layout.setSpacing(6)
-        account_button_layout.addWidget(self.add_account_button)
-        account_button_layout.addWidget(self.delete_account_button)
-
-        account_tools_panel = QWidget()
-        account_tools_panel.setObjectName("account_tools_panel")
-        account_tools_layout = QVBoxLayout(account_tools_panel)
-        account_tools_layout.setContentsMargins(8, 8, 8, 8)
-        account_tools_layout.setSpacing(6)
-
-        sync_button_layout = QHBoxLayout()
-        sync_button_layout.setSpacing(6)
-        sync_button_layout.addWidget(self.oauth_login_button)
-        sync_button_layout.addWidget(self.sync_account_button)
-
-        connection_test_layout = QHBoxLayout()
-        connection_test_layout.setSpacing(6)
-        connection_test_layout.addWidget(self.test_imap_button)
-        connection_test_layout.addWidget(self.test_smtp_button)
-
-        account_tools_layout.addLayout(account_button_layout)
-        account_tools_layout.addLayout(sync_button_layout)
-        account_tools_layout.addLayout(connection_test_layout)
+        self.account_menu_button = QToolButton()
+        self.account_menu_button.setObjectName("account_menu_button")
+        self.account_menu_button.setToolTip("Account actions")
+        self.account_menu_button.setAccessibleName("Account actions")
+        self.account_menu_button.setIcon(
+            QIcon.fromTheme(
+                "application-menu",
+                self.style().standardIcon(
+                    QStyle.StandardPixmap.SP_FileDialogDetailedView
+                ),
+            )
+        )
+        self.account_menu_button.setFixedSize(32, 32)
+        self.account_menu_button.setAutoRaise(True)
+        self.account_menu_button.setPopupMode(
+            QToolButton.ToolButtonPopupMode.InstantPopup
+        )
+        self.account_menu_button.setMenu(self.account_menu)
 
         self.sync_status_label = QLabel("")
         self.sync_status_label.setObjectName("sync_status_label")
         self.sync_status_label.setWordWrap(True)
+        self.sync_status_label.setTextFormat(Qt.TextFormat.PlainText)
         self.sync_status_label.setMaximumHeight(48)
 
         self.folder_list = QListWidget()
         self.folder_list.setObjectName("folder_list")
 
-        layout.addWidget(app_title)
-        layout.addWidget(account_title)
+        account_heading_layout = QHBoxLayout()
+        account_heading_layout.addWidget(account_title, 1)
+        account_heading_layout.addWidget(self.account_menu_button)
+        layout.addLayout(account_heading_layout)
         layout.addWidget(self.account_list)
-        layout.addWidget(account_tools_panel)
-        layout.addWidget(self.sync_status_label)
         layout.addWidget(title)
         layout.addWidget(self.folder_list, 1)
+        layout.addWidget(self.sync_status_label)
 
         return panel
 
@@ -390,36 +489,39 @@ class MainWindow(QMainWindow):
         panel.setMinimumWidth(320)
         panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(8, 12, 12, 12)
-        layout.setSpacing(8)
+        layout.setContentsMargins(8, 6, 8, 8)
+        layout.setSpacing(6)
 
         layout.addWidget(self._build_column_drag_handle("messages"))
 
         self.message_search_edit = QLineEdit()
         self.message_search_edit.setObjectName("message_search_edit")
-        self.message_search_edit.setPlaceholderText("Søk")
+        self.message_search_edit.setPlaceholderText("Search")
+        self.message_search_edit.setClearButtonEnabled(True)
+        self.message_search_edit.setMinimumHeight(30)
         self.message_search_edit.textChanged.connect(self._apply_message_filters)
 
-        self.unread_filter_checkbox = QCheckBox("Uleste")
+        self.unread_filter_checkbox = QCheckBox("Unread")
         self.unread_filter_checkbox.setObjectName("unread_filter_checkbox")
         self.unread_filter_checkbox.toggled.connect(self._apply_message_filters)
 
         self.message_sort_combo = QComboBox()
         self.message_sort_combo.setObjectName("message_sort_combo")
-        self.message_sort_combo.addItem("Nyeste først", "date_desc")
-        self.message_sort_combo.addItem("Eldste først", "date_asc")
-        self.message_sort_combo.addItem("Avsender", "sender")
-        self.message_sort_combo.addItem("Emne", "subject")
+        self.message_sort_combo.addItem("Newest first", "date_desc")
+        self.message_sort_combo.addItem("Oldest first", "date_asc")
+        self.message_sort_combo.addItem("Sender", "sender")
+        self.message_sort_combo.addItem("Subject", "subject")
         self.message_sort_combo.currentIndexChanged.connect(self._apply_message_filters)
 
         filter_bar = QWidget()
         filter_bar.setObjectName("message_filter_bar")
-        filter_bar.setFixedHeight(42)
+        filter_bar.setFixedHeight(max(32, self.message_sort_combo.sizeHint().height()))
         filter_bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         filter_layout = QHBoxLayout(filter_bar)
         filter_layout.setContentsMargins(0, 0, 0, 0)
         filter_layout.setSpacing(8)
         filter_layout.addWidget(self.unread_filter_checkbox)
+        filter_layout.addStretch()
         filter_layout.addWidget(self.message_sort_combo)
 
         self.message_list = QListWidget()
@@ -440,115 +542,113 @@ class MainWindow(QMainWindow):
     def _build_message_view(self) -> QWidget:
         panel = QWidget()
         panel.setObjectName("message_view_panel")
-        panel.setMinimumWidth(520)
+        panel.setMinimumWidth(480)
         panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(12, 12, 8, 12)
-        layout.setSpacing(10)
+        layout.setContentsMargins(8, 6, 8, 8)
+        layout.setSpacing(6)
 
         layout.addWidget(self._build_column_drag_handle("reader"))
 
         self.compose_button = _toolbar_button(
-            "Ny",
+            "New",
             "mail-message-new",
-            "Ny e-post",
+            "New email",
             "compose_button",
         )
         self.compose_button.setObjectName("compose_button")
         self.compose_button.clicked.connect(self._open_new_message_dialog)
 
         self.reply_button = _toolbar_button(
-            "Svar",
+            "Reply",
             "mail-reply-sender",
-            "Svar på valgt e-post",
+            "Reply to selected email",
             "reply_button",
         )
         self.reply_button.setObjectName("reply_button")
         self.reply_button.clicked.connect(self._reply_to_selected_message)
 
         self.forward_button = _toolbar_button(
-            "Videresend",
+            "Forward",
             "mail-forward",
-            "Videresend valgt e-post",
+            "Forward selected email",
             "forward_button",
         )
         self.forward_button.setObjectName("forward_button")
         self.forward_button.clicked.connect(self._forward_selected_message)
 
         self.archive_button = _toolbar_button(
-            "Arkiver",
+            "Archive",
             "archive-insert",
-            "Arkiver valgt e-post",
+            "Archive selected email",
             "archive_button",
         )
         self.archive_button.setObjectName("archive_button")
         self.archive_button.clicked.connect(self._archive_selected_message)
 
         self.trash_button = _toolbar_button(
-            "Søppel",
+            "Trash",
             "user-trash",
-            "Flytt valgt e-post til søppel",
+            "Move selected email to trash",
             "trash_button",
         )
         self.trash_button.setObjectName("trash_button")
         self.trash_button.clicked.connect(self._move_selected_message_to_trash)
 
         self.move_button = _toolbar_button(
-            "Flytt",
+            "Move",
             "folder-move",
-            "Flytt valgt e-post",
+            "Move selected email",
             "move_button",
         )
         self.move_button.setObjectName("move_button")
         self.move_button.clicked.connect(self._move_selected_message)
 
         self.mark_read_button = _toolbar_button(
-            "Lest",
+            "Read",
             "mail-mark-read",
-            "Marker valgt e-post som lest",
+            "Mark selected email as read",
             "mark_read_button",
         )
         self.mark_read_button.setObjectName("mark_read_button")
         self.mark_read_button.clicked.connect(self._mark_selected_message_read)
 
         self.mark_unread_button = _toolbar_button(
-            "Ulest",
+            "Unread",
             "mail-mark-unread",
-            "Marker valgt e-post som ulest",
+            "Mark selected email as unread",
             "mark_unread_button",
         )
         self.mark_unread_button.setObjectName("mark_unread_button")
         self.mark_unread_button.clicked.connect(self._mark_selected_message_unread)
 
-        self.remote_content_checkbox = QCheckBox("Eksternt innhold")
+        self.remote_content_checkbox = QCheckBox("External content")
         self.remote_content_checkbox.setObjectName("remote_content_checkbox")
-        self.remote_content_checkbox.setFixedHeight(34)
         self.remote_content_checkbox.setSizePolicy(
             QSizePolicy.Policy.Fixed,
             QSizePolicy.Policy.Fixed,
         )
         self.remote_content_checkbox.setToolTip(
-            "Tillat eksterne bilder og medier i valgt e-post"
+            "Allow external images and media in selected email"
         )
         self.remote_content_checkbox.toggled.connect(self._toggle_remote_content)
 
         message_toolbar = QWidget()
         self.message_toolbar = message_toolbar
         self.message_toolbar.setObjectName("message_toolbar")
-        self.message_toolbar.setFixedHeight(112)
         self.message_toolbar.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Fixed,
         )
         self.message_toolbar.installEventFilter(self)
         self.message_toolbar_layout = QVBoxLayout(self.message_toolbar)
-        self.message_toolbar_layout.setContentsMargins(8, 7, 8, 7)
-        self.message_toolbar_layout.setSpacing(7)
+        self.message_toolbar_layout.setContentsMargins(4, 4, 4, 4)
+        self.message_toolbar_layout.setSpacing(4)
 
         self.message_action_layout = QHBoxLayout()
         self.message_action_layout.setObjectName("message_action_layout")
         self.message_action_layout.setContentsMargins(0, 0, 0, 0)
-        self.message_action_layout.setSpacing(6)
+        self.message_action_layout.setSpacing(2)
 
         self.message_organize_layout = QHBoxLayout()
         self.message_organize_layout.setObjectName("message_organize_layout")
@@ -564,28 +664,76 @@ class MainWindow(QMainWindow):
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Expanding,
         )
+        self.attachment_bar = QWidget()
+        self.attachment_bar.setObjectName("attachment_bar")
+        self.attachment_bar.setFixedHeight(42)
+        attachment_bar_layout = QHBoxLayout(self.attachment_bar)
+        attachment_bar_layout.setContentsMargins(4, 5, 4, 4)
+        self.attachments_button = _toolbar_button(
+            "Attachments", "mail-attachment", "Show attachments", "attachments_button"
+        )
+        self.attachments_button.clicked.connect(self._attachment_controller.show_dialog)
+        attachment_bar_layout.addWidget(self.attachments_button)
+        attachment_bar_layout.addStretch()
+
+        self.attachment_dialog = QDialog(self)
+        self.attachment_dialog.setWindowTitle("Attachments")
+        self.attachment_dialog.resize(780, 520)
+        self.attachment_dialog.setMinimumSize(540, 320)
+        self.attachment_dialog.finished.connect(
+            self._attachment_controller.preview_closed
+        )
+        dialog_layout = QVBoxLayout(self.attachment_dialog)
+        attachment_splitter = QSplitter(Qt.Orientation.Horizontal)
+        attachment_splitter.setChildrenCollapsible(False)
         self.attachment_list = QListWidget()
         self.attachment_list.setObjectName("attachment_list")
-        self.attachment_list.setMaximumHeight(96)
+        self.attachment_list.setMinimumWidth(160)
+        self.attachment_list.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        self.attachment_list.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
         self.attachment_list.currentItemChanged.connect(
             lambda _current, _previous: self._preview_selected_attachment()
         )
 
         self.attachment_preview = QTextBrowser()
         self.attachment_preview.setObjectName("attachment_preview")
-        self.attachment_preview.setMaximumHeight(170)
         self.attachment_preview.setReadOnly(True)
+        self.attachment_preview.setOpenLinks(False)
+        self.attachment_preview.setMinimumWidth(240)
+        attachment_splitter.addWidget(self.attachment_list)
+        attachment_splitter.addWidget(self.attachment_preview)
+        attachment_splitter.setStretchFactor(1, 1)
+        attachment_splitter.setSizes([230, 530])
+        dialog_layout.addWidget(attachment_splitter, 1)
 
-        self.open_attachment_button = QPushButton("Åpne")
+        self.open_attachment_button = QPushButton("Open")
         self.open_attachment_button.setObjectName("open_attachment_button")
+        self.open_attachment_button.setIcon(
+            QIcon.fromTheme(
+                "document-open",
+                self.style().standardIcon(QStyle.StandardPixmap.SP_DialogOpenButton),
+            )
+        )
         self.open_attachment_button.clicked.connect(self._open_selected_attachment)
 
-        self.save_attachment_button = QPushButton("Lagre som")
+        self.save_attachment_button = QPushButton("Save as")
         self.save_attachment_button.setObjectName("save_attachment_button")
+        self.save_attachment_button.setIcon(
+            QIcon.fromTheme(
+                "document-save-as",
+                self.style().standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton),
+            )
+        )
         self.save_attachment_button.clicked.connect(self._save_selected_attachment)
 
-        self.save_all_attachments_button = QPushButton("Lagre alle")
-        self.save_all_attachments_button.setObjectName("save_all_attachments_button")
+        self.save_all_attachments_button = _toolbar_button(
+            "Save all",
+            "document-save-all",
+            "Save all attachments",
+            "save_all_attachments_button",
+        )
         self.save_all_attachments_button.clicked.connect(
             self._save_all_available_attachments
         )
@@ -594,208 +742,59 @@ class MainWindow(QMainWindow):
         attachment_button_layout.setSpacing(6)
         attachment_button_layout.addWidget(self.open_attachment_button)
         attachment_button_layout.addWidget(self.save_attachment_button)
-        attachment_button_layout.addWidget(self.save_all_attachments_button)
         attachment_button_layout.addStretch()
+        close_buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        close_buttons.button(QDialogButtonBox.StandardButton.Close).setText("Close")
+        close_buttons.rejected.connect(self.attachment_dialog.reject)
+        attachment_button_layout.addWidget(close_buttons)
+        dialog_layout.addLayout(attachment_button_layout)
+        attachment_bar_layout.addWidget(self.save_all_attachments_button)
 
         layout.addWidget(self.message_toolbar)
         layout.addWidget(self.message_view, 1)
-        layout.addWidget(self.attachment_list)
-        layout.addWidget(self.attachment_preview)
-        layout.addLayout(attachment_button_layout)
+        layout.addWidget(self.attachment_bar)
         self._show_attachments([])
 
         return panel
 
     def _build_column_drag_handle(self, column_name: str) -> ColumnDragHandle:
-        handle = ColumnDragHandle(COLUMN_TITLES[column_name], column_name, self)
-        self._column_handles[column_name] = handle
-        return handle
+        return self._layout_controller._build_column_drag_handle(column_name)
 
     def _update_message_toolbar_layout(self) -> None:
-        if not hasattr(self, "message_toolbar"):
-            return
-        width = self.message_toolbar.width()
-        if width >= _single_row_toolbar_width(self):
-            mode = "single"
-        elif width >= _button_chain_toolbar_width(self):
-            mode = "chain"
-        else:
-            mode = "compact"
-        if mode != self._message_toolbar_mode:
-            self._rebuild_message_toolbar(mode=mode)
+        return self._layout_controller._update_message_toolbar_layout()
 
     def _rebuild_message_toolbar(self, *, mode: str) -> None:
-        _clear_layout(self.message_action_layout)
-        _clear_layout(self.message_organize_layout)
-
-        if mode == "compact":
-            self.message_toolbar.setFixedHeight(112)
-            self.message_action_layout.addWidget(self.compose_button)
-            self.message_action_layout.addSpacing(8)
-            self.message_action_layout.addWidget(self.reply_button)
-            self.message_action_layout.addWidget(self.forward_button)
-            self.message_action_layout.addStretch()
-            self.message_action_layout.addWidget(self.remote_content_checkbox)
-
-            self.message_organize_layout.addWidget(self.archive_button)
-            self.message_organize_layout.addWidget(self.trash_button)
-            self.message_organize_layout.addWidget(self.move_button)
-            self.message_organize_layout.addSpacing(8)
-            self.message_organize_layout.addWidget(self.mark_read_button)
-            self.message_organize_layout.addWidget(self.mark_unread_button)
-            self.message_organize_layout.addStretch()
-        elif mode == "chain":
-            self.message_toolbar.setFixedHeight(104)
-            self.message_action_layout.addStretch()
-            self.message_action_layout.addWidget(self.remote_content_checkbox)
-
-            self.message_organize_layout.addWidget(self.compose_button)
-            self.message_organize_layout.addSpacing(8)
-            for button in (
-                self.reply_button,
-                self.forward_button,
-                self.archive_button,
-                self.trash_button,
-                self.move_button,
-                self.mark_read_button,
-                self.mark_unread_button,
-            ):
-                self.message_organize_layout.addWidget(button)
-            self.message_organize_layout.addStretch()
-        else:
-            self.message_toolbar.setFixedHeight(64)
-            self.message_action_layout.addWidget(self.compose_button)
-            self.message_action_layout.addSpacing(8)
-            for button in (
-                self.reply_button,
-                self.forward_button,
-                self.archive_button,
-                self.trash_button,
-                self.move_button,
-                self.mark_read_button,
-                self.mark_unread_button,
-            ):
-                self.message_action_layout.addWidget(button)
-            self.message_action_layout.addStretch()
-            self.message_action_layout.addWidget(self.remote_content_checkbox)
-
-        self.message_organize_layout.setEnabled(mode != "single")
-        self._message_toolbar_mode = mode
+        return self._layout_controller._rebuild_message_toolbar(mode=mode)
 
     def _begin_column_drag(self, _column_name: str) -> None:
-        self._drag_original_order = self._column_order()
-        self._drag_source_column = _column_name
-        _set_widget_property(self._column_panels[_column_name], "dragSource", True)
-        source_handle = self._column_handles.get(_column_name)
-        if source_handle is not None:
-            _set_widget_property(source_handle, "dragging", True)
+        return self._layout_controller._begin_column_drag(_column_name)
 
     def _finish_column_drag(
-        self,
-        column_name: str,
-        global_position: QPoint,
-        *,
-        commit: bool,
+        self, column_name: str, global_position: QPoint, *, commit: bool
     ) -> None:
-        if not commit:
-            self._apply_column_order(self._drag_original_order)
-            self._clear_column_drag_state()
-            return
-
-        target_column = self._column_at_global_position(global_position)
-        if target_column is None or target_column == column_name:
-            self._apply_column_order(self._drag_original_order)
-            self._clear_column_drag_state()
-            return
-
-        target_panel = self._column_panels[target_column]
-        local_position = target_panel.mapFromGlobal(global_position)
-        insert_after_target = local_position.x() > target_panel.width() / 2
-        new_order = _reordered_columns(
-            self._drag_original_order,
-            column_name,
-            target_column,
-            insert_after_target=insert_after_target,
+        return self._layout_controller._finish_column_drag(
+            column_name, global_position, commit=commit
         )
-        self._apply_column_order(new_order)
-        self._clear_column_drag_state()
 
     def _preview_column_drop(self, column_name: str, global_position: QPoint) -> None:
-        target_column = self._column_at_global_position(global_position)
-        if target_column is None or target_column == column_name:
-            self._clear_column_drop_preview()
-            return
-
-        target_panel = self._column_panels[target_column]
-        local_position = target_panel.mapFromGlobal(global_position)
-        insert_after_target = local_position.x() > target_panel.width() / 2
-        preview = (target_column, insert_after_target)
-        if preview == self._drop_preview:
-            return
-
-        self._clear_column_drop_preview()
-        self._drop_preview = preview
-        preview_value = "after" if insert_after_target else "before"
-        _set_widget_property(target_panel, "dropPreview", preview_value)
-        target_handle = self._column_handles.get(target_column)
-        if target_handle is not None:
-            _set_widget_property(target_handle, "dropPreview", preview_value)
+        return self._layout_controller._preview_column_drop(
+            column_name, global_position
+        )
 
     def _clear_column_drag_state(self) -> None:
-        self._clear_column_drop_preview()
-        if self._drag_source_column is not None:
-            _set_widget_property(
-                self._column_panels[self._drag_source_column],
-                "dragSource",
-                False,
-            )
-            source_handle = self._column_handles.get(self._drag_source_column)
-            if source_handle is not None:
-                _set_widget_property(source_handle, "dragging", False)
-        self._drag_source_column = None
+        return self._layout_controller._clear_column_drag_state()
 
     def _clear_column_drop_preview(self) -> None:
-        if self._drop_preview is None:
-            return
-        target_column, _insert_after_target = self._drop_preview
-        target_panel = self._column_panels.get(target_column)
-        if target_panel is not None:
-            _set_widget_property(target_panel, "dropPreview", "")
-        target_handle = self._column_handles.get(target_column)
-        if target_handle is not None:
-            _set_widget_property(target_handle, "dropPreview", "")
-        self._drop_preview = None
+        return self._layout_controller._clear_column_drop_preview()
 
     def _column_order(self) -> tuple[str, ...]:
-        panel_columns = {
-            panel: column_name
-            for column_name, panel in self._column_panels.items()
-        }
-        return tuple(
-            panel_columns[self.main_splitter.widget(index)]
-            for index in range(self.main_splitter.count())
-        )
+        return self._layout_controller._column_order()
 
     def _column_at_global_position(self, global_position: QPoint) -> str | None:
-        for column_name, panel in self._column_panels.items():
-            local_position = panel.mapFromGlobal(global_position)
-            if panel.rect().contains(local_position):
-                return column_name
-        return None
+        return self._layout_controller._column_at_global_position(global_position)
 
     def _apply_column_order(self, order: tuple[str, ...]) -> None:
-        if not self._column_panels:
-            return
-
-        for index, column_name in enumerate(order):
-            self.main_splitter.insertWidget(index, self._column_panels[column_name])
-            stretch = 1 if column_name == "reader" else 0
-            self.main_splitter.setStretchFactor(index, stretch)
-
-        self.main_splitter.setSizes(
-            [COLUMN_WIDTHS[column_name] for column_name in order]
-        )
-        self._update_message_toolbar_layout()
+        return self._layout_controller._apply_column_order(order)
 
     def _load_accounts(self, select_account_id: int | None = None) -> None:
         self.account_list.clear()
@@ -813,19 +812,36 @@ class MainWindow(QMainWindow):
             self._set_compose_actions_enabled(False)
             return
 
-        unified_item = QListWidgetItem("Alle innbokser")
+        unified_item = QListWidgetItem("All inboxes")
+        unified_item.setIcon(
+            QIcon.fromTheme(
+                "mail-folder-inbox",
+                self.style().standardIcon(QStyle.StandardPixmap.SP_DirHomeIcon),
+            )
+        )
         unified_item.setData(Qt.ItemDataRole.UserRole, UNIFIED_INBOX_ROLE)
         self.account_list.addItem(unified_item)
 
         selected_row = 0
         for account in accounts:
             item = QListWidgetItem(account.display_name)
+            item.setToolTip(account.email_address)
+            item.setIcon(
+                QIcon.fromTheme(
+                    "user-identity",
+                    self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon),
+                )
+            )
             item.setData(Qt.ItemDataRole.UserRole, account.id)
             self.account_list.addItem(item)
 
             if select_account_id == account.id:
                 selected_row = self.account_list.count() - 1
 
+        row_height = max(34, self.account_list.sizeHintForRow(0))
+        self.account_list.setFixedHeight(
+            min(self.account_list.count(), 5) * row_height + 2
+        )
         self.account_list.setCurrentRow(selected_row)
         self._set_compose_actions_enabled(True)
         self._set_account_actions_enabled(self._selected_account_id() is not None)
@@ -852,29 +868,31 @@ class MainWindow(QMainWindow):
         account_id = current.data(Qt.ItemDataRole.UserRole)
         if account_id == UNIFIED_INBOX_ROLE:
             self._set_account_actions_enabled(False)
-            item = QListWidgetItem("Alle innbokser")
-            item.setData(Qt.ItemDataRole.UserRole, UNIFIED_INBOX_ROLE)
+            account_id = None
+
+        for label, role, icon_name, fallback in (
+            (
+                "Inbox",
+                "Innboks",
+                "mail-folder-inbox",
+                QStyle.StandardPixmap.SP_DirIcon,
+            ),
+            ("Trash", "Papirkurv", "user-trash", QStyle.StandardPixmap.SP_TrashIcon),
+            (
+                "Spam",
+                "Søppelpost",
+                "mail-mark-junk",
+                QStyle.StandardPixmap.SP_MessageBoxWarning,
+            ),
+        ):
+            item = QListWidgetItem(label)
+            item.setIcon(
+                QIcon.fromTheme(icon_name, self.style().standardIcon(fallback))
+            )
+            item.setData(Qt.ItemDataRole.UserRole, (account_id, role))
             self.folder_list.addItem(item)
-            self.folder_list.setCurrentRow(0)
-            return
 
-        folders = sorted(
-            [
-                folder
-                for folder in self._mail_store.list_folders(account_id)
-                if _is_core_folder(folder.name, folder.remote_id)
-            ],
-            key=lambda folder: _folder_sort_key(folder.name),
-        )
-
-        for folder in folders:
-            item = QListWidgetItem(_folder_display_name(folder.name))
-            item.setToolTip(folder.name)
-            item.setData(Qt.ItemDataRole.UserRole, (folder.account_id, folder.id))
-            self.folder_list.addItem(item)
-
-        if self.folder_list.count() > 0:
-            self.folder_list.setCurrentRow(0)
+        self.folder_list.setCurrentRow(0)
 
     def _load_selected_folder(
         self,
@@ -892,35 +910,48 @@ class MainWindow(QMainWindow):
         if current is None:
             return
 
-        folder_data = current.data(Qt.ItemDataRole.UserRole)
-        self._current_folder_is_unified = folder_data == UNIFIED_INBOX_ROLE
-        if folder_data == UNIFIED_INBOX_ROLE:
-            messages = self._mail_store.list_unified_inbox_messages()
-        else:
-            account_id, folder_id = folder_data
-            messages = self._mail_store.list_messages(account_id, folder_id)
-
-        self._current_messages = messages
+        account_id, role = current.data(Qt.ItemDataRole.UserRole)
+        self._current_folder_is_unified = account_id is None
         self._apply_message_filters()
 
     def _apply_message_filters(self, *_args: object) -> None:
         self.message_list.clear()
         self._messages_by_id.clear()
 
-        query = self.message_search_edit.text().strip().casefold()
-        unread_only = self.unread_filter_checkbox.isChecked()
-        messages = [
-            message
-            for message in self._current_messages
-            if _message_matches_filters(message, query, unread_only)
-        ]
-        messages = _sort_messages(messages, self.message_sort_combo.currentData())
+        current = self.folder_list.currentItem()
+        self._current_messages = []
+        if current is None:
+            return
+        account_id, role = current.data(Qt.ItemDataRole.UserRole)
+        filters = EmailFilters(
+            account_id=account_id, mailbox=role,
+            is_read=False if self.unread_filter_checkbox.isChecked() else None,
+        )
+        messages = []
+        offset = 0
+        try:
+            # Keep the existing full-list UI while the shared API stays paginated.
+            while True:
+                page = self._mail_reader.search_emails(
+                    self.message_search_edit.text(), filters, limit=MAX_PAGE_SIZE,
+                    offset=offset, sort_order=self.message_sort_combo.currentData(),
+                )
+                messages.extend(page.items)
+                if page.next_offset is None:
+                    break
+                offset = page.next_offset
+        except MailReadError as error:
+            self.sync_status_label.setText(str(error))
+            return
+        self._current_messages = messages
 
         for message in messages:
             item = QListWidgetItem()
             item.setData(MESSAGE_TEXT_ROLE, self._message_item_text(message))
             item.setData(Qt.ItemDataRole.UserRole, message.id)
-            item.setSizeHint(QSize(280, 102))
+            item.setSizeHint(
+                QSize(280, max(102, self.fontMetrics().lineSpacing() * 4 + 30))
+            )
             _configure_message_item(item, message)
             self.message_list.addItem(item)
             self.message_list.setItemWidget(item, self._build_message_item(message))
@@ -939,7 +970,7 @@ class MainWindow(QMainWindow):
         meta_layout.setSpacing(6)
 
         sender = _message_sender_label(message)
-        sender_label = QLabel(sender)
+        sender_label = ElidedLabel(sender)
         sender_label.setObjectName("message_item_sender")
 
         date_label = QLabel(_short_message_date(message))
@@ -949,12 +980,11 @@ class MainWindow(QMainWindow):
         meta_layout.addWidget(sender_label, 1)
         meta_layout.addWidget(date_label)
 
-        subject_label = QLabel(message.subject or "(uten emne)")
+        subject_label = ElidedLabel(message.subject or "(no subject)")
         subject_label.setObjectName("message_item_subject")
 
-        preview_label = QLabel(message.body_preview.strip())
+        preview_label = ElidedLabel(message.body_preview.strip())
         preview_label.setObjectName("message_item_preview")
-        preview_label.setWordWrap(True)
 
         account = self._mail_store.get_account(message.account_id)
         if (
@@ -962,7 +992,7 @@ class MainWindow(QMainWindow):
             and account is not None
             and account.email_address.casefold() != sender.casefold()
         ):
-            account_label = QLabel(account.email_address)
+            account_label = ElidedLabel(account.email_address)
             account_label.setObjectName("message_item_account")
             layout.addWidget(account_label)
 
@@ -975,7 +1005,7 @@ class MainWindow(QMainWindow):
         return card
 
     def _message_item_text(self, message: Message) -> str:
-        subject = message.subject or "(uten emne)"
+        subject = message.subject or "(no subject)"
         sender = _message_sender_label(message)
         preview = message.body_preview.strip()
         if not self._current_folder_is_unified:
@@ -1003,15 +1033,33 @@ class MainWindow(QMainWindow):
             return
 
         message_id = current.data(Qt.ItemDataRole.UserRole)
-        message = self._messages_by_id[message_id]
+        try:
+            details = self._mail_reader.get_email(message_id)
+        except MailReadError as error:
+            self.message_view.set_empty()
+            self._show_attachments([])
+            self._set_message_actions_enabled(False)
+            self.sync_status_label.setText(str(error))
+            return
+        message = details.message
         account = self._mail_store.get_account(message.account_id)
         account_label = account.email_address if account is not None else ""
-        attachments = self._mail_store.list_attachments(message.id)
+        attachments = list(details.attachments)
         self.message_view.show_message(message, account_label, attachments)
         self._show_attachments(attachments)
         self._set_message_actions_enabled(True)
 
+    def _open_oauth_settings(self) -> None:
+        if self._task_runner.busy or self._sync_in_progress or self._send_in_progress:
+            return
+        OAuthSettingsDialog(self).exec()
+
     def _open_add_account_dialog(self) -> None:
+        if self._sync_in_progress or self._task_runner.busy:
+            self.sync_status_label.setText(
+                "Wait for sync or account setup to finish."
+            )
+            return
         dialog = AccountDialog(self)
 
         if dialog.exec() != AccountDialog.DialogCode.Accepted:
@@ -1031,7 +1079,63 @@ class MainWindow(QMainWindow):
             smtp_port=data.smtp_port,
             smtp_security=data.smtp_security,
             password=data.password,
+            provider=data.provider,
+            local_certificate=data.local_certificate,
         )
+
+    def _open_edit_account_dialog(self) -> None:
+        if (
+            self._sync_in_progress
+            or self._send_in_progress
+            or self._editing_account
+            or self._task_runner.busy
+        ):
+            self.sync_status_label.setText(
+                "Wait for sync or sending to finish."
+            )
+            return
+        account_id = self._selected_account_id()
+        account = (
+            self._mail_store.get_account(account_id) if account_id is not None else None
+        )
+        if account is None:
+            return
+        self._editing_account = True
+        try:
+            dialog = AccountDialog(self, account=account)
+            while dialog.exec() == AccountDialog.DialogCode.Accepted:
+                data = dialog.account_data()
+                updated = replace(
+                    account,
+                    display_name=data.display_name,
+                    username=data.username,
+                    imap_host=data.imap_host,
+                    imap_port=data.imap_port,
+                    imap_security=data.imap_security,
+                    smtp_host=data.smtp_host,
+                    smtp_port=data.smtp_port,
+                    smtp_security=data.smtp_security,
+                    local_certificate=data.local_certificate,
+                )
+                try:
+                    AccountSettingsService(self._mail_store).save(
+                        updated, data.password
+                    )
+                except Exception:
+                    QMessageBox.warning(
+                        self,
+                        "Could not save account",
+                        "Check the settings and make sure the system keyring "
+                        "is available.",
+                    )
+                    continue
+                self._load_accounts(select_account_id=account.id)
+                self.sync_status_label.setText(
+                    "Account updated. Sync to refresh folders and messages."
+                )
+                break
+        finally:
+            self._editing_account = False
 
     def _add_account(
         self,
@@ -1048,22 +1152,31 @@ class MainWindow(QMainWindow):
         smtp_security: str = "starttls",
         password: str | None = None,
         oauth_provider: str | None = None,
+        provider: str = "imap",
+        local_certificate: str | None = None,
     ) -> bool:
+        if provider == "tuta":
+            if self._sync_in_progress:
+                return False
+            self._start_tuta_setup(
+                display_name, email_address, password, local_certificate
+            )
+            return True
         client_id = None
         client_secret = None
         if auth_method == "oauth2":
             if oauth_provider is None:
                 QMessageBox.warning(
                     self,
-                    "OAuth mangler provider",
-                    "Velg Gmail eller Outlook for OAuth2-kontoen.",
+                    "OAuth provider missing",
+                    "Select Gmail or Outlook for the OAuth2 account.",
                 )
                 return False
             try:
                 client_id = get_oauth_client_id(oauth_provider)
                 client_secret = get_oauth_client_secret(oauth_provider)
             except (KeyError, OAuthClientConfigError) as error:
-                QMessageBox.warning(self, "OAuth mangler konfigurasjon", str(error))
+                QMessageBox.warning(self, "OAuth configuration missing", str(error))
                 return False
 
             (
@@ -1096,6 +1209,7 @@ class MainWindow(QMainWindow):
                 smtp_port=smtp_port,
                 smtp_security=smtp_security,
                 oauth_provider=oauth_provider,
+                provider=provider,
             )
             if auth_method == "password" and password:
                 save_password(account.email_address, password)
@@ -1109,17 +1223,17 @@ class MainWindow(QMainWindow):
         except sqlite3.IntegrityError:
             QMessageBox.warning(
                 self,
-                "Kunne ikke legge til konto",
-                "En konto med denne e-postadressen finnes allerede.",
+                "Could not add account",
+                "An account with this email address already exists.",
             )
             return False
         except Exception as error:
             if "account" in locals():
                 self._mail_store.delete_account(account.id)
             title = (
-                "OAuth innlogging feilet"
+                "OAuth sign-in failed"
                 if auth_method == "oauth2"
-                else "Kunne ikke lagre passord"
+                else "Could not save password"
             )
             QMessageBox.warning(self, title, str(error))
             self._load_accounts()
@@ -1128,7 +1242,55 @@ class MainWindow(QMainWindow):
         self._load_accounts(select_account_id=account.id)
         return True
 
+    def _start_tuta_setup(
+        self,
+        display_name: str,
+        email_address: str,
+        password: str | None,
+        local_certificate: str | None,
+    ) -> None:
+        self._set_sync_in_progress(True)
+        self.sync_status_label.setText("Testing TutaBridge IMAP and SMTP...")
+        thread = QThread(self)
+        worker = TutaSetupWorker(
+            TutaSetupService(self._mail_store),
+            self._mail_sync_service,
+            display_name,
+            email_address,
+            password,
+            Path(local_certificate) if local_certificate else None,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.account_created.connect(self._handle_tuta_account_created)
+        worker.finished.connect(self._handle_sync_finished)
+        worker.failed.connect(self._handle_tuta_setup_failed)
+        worker.done.connect(thread.quit)
+        worker.done.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._cleanup_tuta_setup)
+        self._tuta_setup_thread = thread
+        self._tuta_setup_worker = worker
+        thread.start()
+
+    def _handle_tuta_account_created(self, account: Account) -> None:
+        self._load_accounts(select_account_id=account.id)
+        self.sync_status_label.setText(
+            "Tuta account saved. Fetching up to five inbox messages..."
+        )
+
+    def _handle_tuta_setup_failed(self, message: str) -> None:
+        self.sync_status_label.setText("Tuta setup or initial sync failed")
+        QMessageBox.warning(self, "TutaBridge", message)
+
+    def _cleanup_tuta_setup(self) -> None:
+        self._tuta_setup_thread = None
+        self._tuta_setup_worker = None
+        self._set_sync_in_progress(False)
+
     def _delete_selected_account(self) -> bool:
+        if self._task_runner.busy or self._sync_in_progress or self._send_in_progress:
+            return False
         current = self.account_list.currentItem()
         if current is None:
             return False
@@ -1137,8 +1299,8 @@ class MainWindow(QMainWindow):
         account_name = current.text()
         answer = QMessageBox.question(
             self,
-            "Slett konto",
-            f"Slette lokal konto '{account_name}'?",
+            "Delete account",
+            f"Delete local account '{account_name}'?",
         )
         if answer != QMessageBox.StandardButton.Yes:
             return False
@@ -1165,26 +1327,23 @@ class MainWindow(QMainWindow):
         if account.auth_method != "oauth2" or account.oauth_provider is None:
             QMessageBox.warning(
                 self,
-                "OAuth ikke tilgjengelig",
-                "Valgt konto bruker ikke OAuth2.",
+                "OAuth unavailable",
+                "The selected account does not use OAuth2.",
             )
             return False
 
         try:
             client_id = get_oauth_client_id(account.oauth_provider)
             client_secret = get_oauth_client_secret(account.oauth_provider)
-            self._authorize_oauth_provider(
+            return self._authorize_oauth_provider(
                 account.email_address,
                 account.oauth_provider,
                 client_id,
                 client_secret,
             )
         except Exception as error:
-            self._show_sync_error("OAuth innlogging feilet", error)
+            self._show_sync_error("OAuth sign-in failed", error)
             return False
-
-        self.sync_status_label.setText("OAuth innlogging OK")
-        return True
 
     def _authorize_oauth_provider(
         self,
@@ -1192,61 +1351,78 @@ class MainWindow(QMainWindow):
         provider: str,
         client_id: str,
         client_secret: str | None,
-    ) -> None:
-        tokens = self._oauth_login_service.authorize(
-            provider,
-            client_id,
-            client_secret=client_secret,
+    ) -> bool:
+        def authorize() -> bool:
+            tokens = self._oauth_login_service.authorize(
+                provider,
+                client_id,
+                client_secret=client_secret,
+            )
+            save_oauth_tokens(email_address, tokens)
+            return True
+
+        return self._start_task(
+            "Waiting for OAuth sign-in...",
+            authorize,
+            lambda result: self._complete_task(result, "OAuth sign-in successful"),
         )
-        save_oauth_tokens(email_address, tokens)
 
     def _test_selected_imap_connection(self) -> bool:
         account_id = self._selected_account_id()
         if account_id is None:
             return False
-
-        try:
-            connected = self._mail_sync_service.test_imap_connection(account_id)
-        except Exception as error:
-            self._show_sync_error("IMAP-test feilet", error)
-            return False
-
-        self.sync_status_label.setText(
-            "IMAP-tilkobling OK" if connected else "IMAP-tilkobling feilet"
+        return self._start_task(
+            "Testing IMAP...",
+            lambda: self._mail_sync_service.test_imap_connection(account_id),
+            lambda result: self._complete_task(result, "IMAP connection successful"),
         )
-        return connected
 
     def _test_selected_smtp_connection(self) -> bool:
         account_id = self._selected_account_id()
         if account_id is None:
             return False
-
-        try:
-            connected = self._mail_sync_service.test_smtp_connection(account_id)
-        except Exception as error:
-            self._show_sync_error("SMTP-test feilet", error)
-            return False
-
-        self.sync_status_label.setText(
-            "SMTP-tilkobling OK" if connected else "SMTP-tilkobling feilet"
+        return self._start_task(
+            "Testing SMTP...",
+            lambda: self._mail_sync_service.test_smtp_connection(account_id),
+            lambda result: self._complete_task(result, "SMTP connection successful"),
         )
-        return connected
 
     def _sync_selected_account(self) -> bool:
+        if (
+            self._sync_in_progress
+            or self._sync_queue
+            or self._manual_sync_batch
+            or self._send_in_progress
+            or self._task_runner.busy
+            or self._editing_account
+        ):
+            self.sync_status_label.setText("Wait for the current operation to finish.")
+            return False
         account_id = self._selected_account_id()
-        if account_id is None:
+        if account_id is not None:
+            self._sync_queue_failures.clear()
+            return self._start_sync_worker(account_id)
+        current = self.account_list.currentItem()
+        if (
+            current is None
+            or current.data(Qt.ItemDataRole.UserRole) != UNIFIED_INBOX_ROLE
+        ):
             return False
-        if self._sync_in_progress:
-            self.sync_status_label.setText("Synkronisering kjører allerede.")
+        self._sync_queue = self._syncable_account_ids()
+        if not self._sync_queue:
+            self.sync_status_label.setText(
+                "No accounts with IMAP settings to sync."
+            )
             return False
-
-        self._start_sync_worker(account_id)
-        return True
+        self._manual_sync_batch = True
+        self._sync_queue_failures.clear()
+        self._next_queued_sync()
+        return self._sync_in_progress
 
     def _open_new_message_dialog(self) -> bool:
         accounts = self._mail_store.list_accounts()
         if not accounts:
-            QMessageBox.warning(self, "Kan ikke sende", "Legg til en konto først.")
+            QMessageBox.warning(self, "Cannot send", "Add an account first.")
             return False
 
         account_id = self._selected_account_id() or accounts[0].id
@@ -1267,37 +1443,79 @@ class MainWindow(QMainWindow):
         if message_id is None:
             return False
 
+        if self._mail_store.list_attachments(message_id):
+            return self._start_task(
+                "Preparing forwarded message...",
+                lambda: self._mail_send_service.create_forward_draft(message_id),
+                lambda draft: (
+                    self._open_compose_dialog(draft)
+                    if isinstance(draft, ComposeDraft)
+                    else None
+                ),
+            )
         draft = self._mail_send_service.create_forward_draft(message_id)
         if draft is None:
             return False
         return self._open_compose_dialog(draft)
 
-    def _open_compose_dialog(self, draft: ComposeDraft) -> bool:
+    def _open_saved_drafts(self) -> None:
+        if self._send_in_progress:
+            return
+        dialog = DraftDialog(self._draft_service, self)
+        if dialog.exec() == dialog.DialogCode.Accepted and dialog.selected():
+            item = dialog.selected()
+            self._open_compose_dialog(
+                item.draft, item.id, item.state in {"sending", "uncertain"}
+            )
+
+    def _open_compose_dialog(
+        self, draft: ComposeDraft, draft_id: int | None = None, uncertain: bool = False
+    ) -> bool:
         accounts = self._mail_store.list_accounts()
         if not accounts:
-            QMessageBox.warning(self, "Kan ikke sende", "Legg til en konto først.")
+            QMessageBox.warning(self, "Cannot send", "Add an account first.")
             return False
 
-        dialog = ComposeDialog(accounts, draft, self)
+        dialog = ComposeDialog(
+            accounts,
+            draft,
+            self,
+            draft_service=self._draft_service,
+            draft_id=draft_id,
+            uncertain=uncertain,
+        )
         if dialog.exec() != ComposeDialog.DialogCode.Accepted:
             return False
 
-        return self._send_draft(dialog.draft())
+        return self._send_draft(dialog.draft(), dialog.draft_id)
 
-    def _send_draft(self, draft: ComposeDraft) -> bool:
-        if self._send_in_progress:
-            self.sync_status_label.setText("Sending kjører allerede.")
+    def _send_draft(self, draft: ComposeDraft, draft_id: int | None = None) -> bool:
+        if self._send_in_progress or self._task_runner.busy:
+            self.sync_status_label.setText("A message is already being sent.")
             return False
 
+        try:
+            self._sending_draft_id = self._draft_service.save(draft, draft_id)
+            draft = self._draft_service.get(self._sending_draft_id).draft
+            self._draft_service.set_state(self._sending_draft_id, "sending")
+        except Exception:
+            QMessageBox.warning(
+                self,
+                "Sending cancelled",
+                "Could not save the draft safely. No email was sent.",
+            )
+            return False
         self._start_send_worker(draft)
         return True
 
     def _start_send_worker(self, draft: ComposeDraft) -> None:
         self._set_send_in_progress(True)
-        self.sync_status_label.setText("Sender...")
+        self.sync_status_label.setText("Sending...")
 
         thread = QThread(self)
-        worker = MailSendWorker(self._mail_send_service, draft)
+        worker = MailSendWorker(
+            self._mail_send_service, draft, self._draft_service, self._sending_draft_id
+        )
         worker.moveToThread(thread)
 
         thread.started.connect(worker.run)
@@ -1312,6 +1530,66 @@ class MainWindow(QMainWindow):
         self._send_worker = worker
         thread.start()
 
+    def initialize_bridge(self) -> None:
+        """Check or start the bridge once at application startup, if used."""
+        if any(
+            account.provider == "tuta" for account in self._mail_store.list_accounts()
+        ):
+            self._run_bridge_check(start=self.bridge_autostart_action.isChecked())
+
+    def _run_bridge_check(self, *, start: bool = False) -> None:
+        if self._bridge_thread is not None:
+            return
+        account_id = self._selected_account_id()
+        account = self._mail_store.get_account(account_id) if account_id else None
+        if account is None or account.provider != "tuta":
+            account = next(
+                (a for a in self._mail_store.list_accounts() if a.provider == "tuta"),
+                None,
+            )
+        certificate = (
+            Path(account.local_certificate)
+            if account and account.local_certificate
+            else None
+        )
+        thread = QThread(self)
+        worker = BridgeWorker(self._bridge_runtime_service, certificate, start=start)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._handle_bridge_status)
+        worker.failed.connect(self._handle_bridge_failure)
+        worker.done.connect(thread.quit)
+        worker.done.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._cleanup_bridge_worker)
+        self._bridge_thread = thread
+        self._bridge_worker = worker
+        self.bridge_start_action.setEnabled(False)
+        self.bridge_check_action.setEnabled(False)
+        self.bridge_status_label.show()
+        self.bridge_status_label.setText(
+            "Tuta: starting..." if start else "Tuta: checking..."
+        )
+        thread.start()
+
+    def _handle_bridge_status(self, status: BridgeStatus) -> None:
+        self.bridge_status_label.setText(
+            "Tuta: TLS available" if status.ready else "Tuta: not ready"
+        )
+        self.bridge_status_label.setToolTip(status.message)
+        self.statusBar().showMessage(status.message, 15000)
+
+    def _handle_bridge_failure(self, message: str) -> None:
+        self.bridge_status_label.setText("Tuta: needs attention")
+        self.bridge_status_label.setToolTip(message)
+        self.statusBar().showMessage(message, 15000)
+
+    def _cleanup_bridge_worker(self) -> None:
+        self._bridge_thread = None
+        self._bridge_worker = None
+        self.bridge_start_action.setEnabled(True)
+        self.bridge_check_action.setEnabled(True)
+
     def _handle_send_finished(self, result: object) -> None:
         if isinstance(result, SendResult):
             if result.sent:
@@ -1319,207 +1597,89 @@ class MainWindow(QMainWindow):
                 self._reload_current_folder()
                 return
         elif result:
-            self.sync_status_label.setText("E-post sendt.")
+            self.sync_status_label.setText("Email sent.")
             self._reload_current_folder()
             return
 
-        self.sync_status_label.setText("Sending feilet")
+        self.sync_status_label.setText("Sending failed")
         QMessageBox.warning(
             self,
-            "Sending feilet",
-            "Mangler konto-, SMTP- eller innloggingsinformasjon.",
+            "Sending failed",
+            "Account, SMTP or sign-in details are missing.",
         )
 
     def _handle_send_failed(self, error_message: str) -> None:
-        self.sync_status_label.setText("Sending feilet")
+        self.sync_status_label.setText(
+            "Sending could not be confirmed. The draft has been kept."
+        )
         QMessageBox.warning(
             self,
-            "Sending feilet",
-            _friendly_error_message(error_message),
+            "Sending failed",
+            _friendly_error_message(error_message)
+            + "\n\nThe draft is available under Message > Drafts. "
+            "Check Sent before trying again.",
         )
 
     def _cleanup_send_worker(self) -> None:
         self._send_thread = None
         self._send_worker = None
+        self._sending_draft_id = None
         self._set_send_in_progress(False)
+        if self.auto_sync_action.isChecked():
+            QTimer.singleShot(0, self._queue_auto_sync)
 
     def _reload_current_folder(self) -> None:
+        selected_id = self._selected_message_id()
         current = self.folder_list.currentItem()
         if current is not None:
             self._load_selected_folder(current, None)
+            for row in range(self.message_list.count()):
+                if (
+                    self.message_list.item(row).data(Qt.ItemDataRole.UserRole)
+                    == selected_id
+                ):
+                    self.message_list.setCurrentRow(row)
+                    break
 
     def _toggle_remote_content(self, allowed: bool) -> None:
         self.message_view.set_remote_content_allowed(allowed)
         self._rerender_selected_message()
 
     def _rerender_selected_message(self) -> None:
-        message_id = self._selected_message_id()
-        if message_id is None:
-            return
-
-        message = self._messages_by_id.get(message_id)
-        if message is None:
-            return
-
-        account = self._mail_store.get_account(message.account_id)
-        account_label = account.email_address if account is not None else ""
-        attachments = self._mail_store.list_attachments(message.id)
-        self.message_view.show_message(message, account_label, attachments)
-        self._show_attachments(attachments)
+        self._show_selected_message(self.message_list.currentItem(), None)
 
     def _show_attachments(self, attachments: list[Attachment]) -> None:
-        self._attachments_by_id = {attachment.id: attachment for attachment in attachments}
-        has_attachments = bool(attachments)
-        self.attachment_list.setVisible(has_attachments)
-        self.attachment_preview.setVisible(False)
-        self.open_attachment_button.setVisible(has_attachments)
-        self.save_attachment_button.setVisible(has_attachments)
-        self.save_all_attachments_button.setVisible(has_attachments)
-        self.attachment_list.clear()
-        for attachment in attachments:
-            suffix = "" if attachment.has_content else " - ikke lagret lokalt"
-            item = QListWidgetItem(
-                f"{_attachment_type_label(attachment)} {attachment.filename} "
-                f"({_format_attachment_size(attachment.size)}, "
-                f"{_display_content_type(attachment.content_type)}){suffix}"
-            )
-            item.setData(Qt.ItemDataRole.UserRole, attachment.id)
-            item.setToolTip(attachment.filename)
-            self.attachment_list.addItem(item)
-        self._preview_selected_attachment()
+        return self._attachment_controller._show_attachments(attachments)
 
     def _selected_attachment(self) -> Attachment | None:
-        current = self.attachment_list.currentItem()
-        if current is None:
-            return None
-        attachment_id = current.data(Qt.ItemDataRole.UserRole)
-        if not isinstance(attachment_id, int):
-            return None
-        return self._attachments_by_id.get(attachment_id)
+        return self._attachment_controller._selected_attachment()
 
     def _update_attachment_actions(self) -> None:
-        attachment = self._selected_attachment()
-        enabled = attachment is not None and attachment.has_content
-        self.open_attachment_button.setEnabled(enabled)
-        self.save_attachment_button.setEnabled(enabled)
-        self.save_all_attachments_button.setEnabled(
-            any(attachment.has_content for attachment in self._attachments_by_id.values())
-        )
+        return self._attachment_controller._update_attachment_actions()
+
+    def _resume_attachment_preview(self) -> None:
+        return self._attachment_controller._resume_attachment_preview()
 
     def _preview_selected_attachment(self) -> None:
-        attachment = self._selected_attachment()
-        self._update_attachment_actions()
-        if attachment is None:
-            self.attachment_preview.setHtml("")
-            self.attachment_preview.setVisible(False)
-            return
-        self.attachment_preview.setVisible(True)
-        if not attachment.has_content:
-            self.attachment_preview.setHtml(
-                "<p>Vedlegget er ikke lagret lokalt ennå.</p>"
-            )
-            return
+        return self._attachment_controller._preview_selected_attachment()
 
-        content = self._mail_store.get_attachment_content(attachment.id)
-        if content is None:
-            self.attachment_preview.setHtml(
-                "<p>Vedlegget er ikke lagret lokalt ennå.</p>"
-            )
-            return
+    def _attachment_loaded(self, attachment: Attachment, content: object) -> None:
+        return self._attachment_controller._attachment_loaded(attachment, content)
 
-        self.attachment_preview.setHtml(_attachment_preview_html(attachment, content))
+    def _clear_attachment_cache(self) -> None:
+        return self._attachment_controller._clear_attachment_cache()
+
+    def _cache_cleared(self) -> None:
+        return self._attachment_controller._cache_cleared()
 
     def _save_selected_attachment(self) -> bool:
-        attachment = self._selected_attachment()
-        if attachment is None:
-            return False
-
-        content = self._mail_store.get_attachment_content(attachment.id)
-        if content is None:
-            QMessageBox.warning(
-                self,
-                "Vedlegg mangler",
-                "Vedlegget er ikke lagret lokalt ennå.",
-            )
-            return False
-
-        save_path, _selected_filter = QFileDialog.getSaveFileName(
-            self,
-            "Lagre vedlegg",
-            str(Path.home() / "Nedlastinger" / _safe_filename(attachment.filename)),
-        )
-        if not save_path:
-            return False
-
-        Path(save_path).write_bytes(content)
-        self.sync_status_label.setText("Vedlegg lagret.")
-        return True
+        return self._attachment_controller._save_selected_attachment()
 
     def _save_all_available_attachments(self) -> bool:
-        attachments = [
-            attachment
-            for attachment in self._attachments_by_id.values()
-            if attachment.has_content
-        ]
-        if not attachments:
-            return False
-
-        directory = QFileDialog.getExistingDirectory(
-            self,
-            "Lagre alle vedlegg",
-            str(Path.home() / "Nedlastinger"),
-        )
-        if not directory:
-            return False
-
-        target_dir = Path(directory)
-        saved_count = 0
-        for attachment in attachments:
-            content = self._mail_store.get_attachment_content(attachment.id)
-            if content is None:
-                continue
-            target_path = _unique_attachment_path(
-                target_dir,
-                _safe_filename(attachment.filename),
-            )
-            target_path.write_bytes(content)
-            saved_count += 1
-
-        if saved_count == 0:
-            return False
-
-        self.sync_status_label.setText(f"Lagret {saved_count} vedlegg.")
-        return True
+        return self._attachment_controller._save_all_available_attachments()
 
     def _open_selected_attachment(self) -> bool:
-        attachment = self._selected_attachment()
-        if attachment is None:
-            return False
-
-        content = self._mail_store.get_attachment_content(attachment.id)
-        if content is None:
-            QMessageBox.warning(
-                self,
-                "Vedlegg mangler",
-                "Vedlegget er ikke lagret lokalt ennå.",
-            )
-            return False
-
-        cache_dir = Path(tempfile.gettempdir()) / "mailklient-attachments"
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        path = cache_dir / f"{attachment.id}-{_safe_filename(attachment.filename)}"
-        path.write_bytes(content)
-
-        opened = QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
-        if not opened:
-            QMessageBox.warning(
-                self,
-                "Kunne ikke åpne vedlegg",
-                "Fant ingen app som kunne åpne filen.",
-            )
-            return False
-
-        return True
+        return self._attachment_controller._open_selected_attachment()
 
     def _mark_selected_message_read(self) -> bool:
         return self._mark_selected_message(is_read=True)
@@ -1528,67 +1688,39 @@ class MainWindow(QMainWindow):
         return self._mark_selected_message(is_read=False)
 
     def _mark_selected_message(self, *, is_read: bool) -> bool:
-        current = self.message_list.currentItem()
-        if current is None:
+        message_id = self._selected_message_id()
+        if message_id is None:
             return False
-
-        message_id = current.data(Qt.ItemDataRole.UserRole)
-        try:
-            updated = self._mail_sync_service.mark_message_read(message_id, is_read)
-        except Exception as error:
-            self._show_sync_error("Kunne ikke oppdatere melding", error)
-            return False
-
-        if not updated:
-            self.sync_status_label.setText("Kunne ikke oppdatere melding.")
-            return False
-
-        message = self._mail_store.get_message(message_id)
-        if message is not None:
-            self._messages_by_id[message.id] = message
-            _configure_message_item(current, message)
-            account = self._mail_store.get_account(message.account_id)
-            account_label = account.email_address if account is not None else ""
-            attachments = self._mail_store.list_attachments(message.id)
-            self.message_view.show_message(message, account_label, attachments)
-            self._show_attachments(attachments)
-
-        self.sync_status_label.setText(
-            "Melding markert som lest." if is_read else "Melding markert som ulest."
+        label = "Message marked as read." if is_read else "Message marked as unread."
+        return self._start_task(
+            "Updating message...",
+            lambda: self._mail_sync_service.mark_message_read(message_id, is_read),
+            lambda result: self._complete_task(result, label, reload=True),
         )
-        return True
 
     def _move_selected_message_to_trash(self) -> bool:
         message_id = self._selected_message_id()
         if message_id is None:
             return False
-
-        try:
-            moved = self._mail_sync_service.move_message_to_trash(message_id)
-        except Exception as error:
-            self._show_sync_error("Kunne ikke flytte til søppel", error)
-            return False
-
-        if moved:
-            self.sync_status_label.setText("Melding flyttet til søppel.")
-            self._reload_current_folder()
-        return moved
+        return self._start_task(
+            "Moving to trash...",
+            lambda: self._mail_sync_service.move_message_to_trash(message_id),
+            lambda result: self._complete_task(
+                result, "Message moved to trash.", reload=True
+            ),
+        )
 
     def _archive_selected_message(self) -> bool:
         message_id = self._selected_message_id()
         if message_id is None:
             return False
-
-        try:
-            archived = self._mail_sync_service.archive_message(message_id)
-        except Exception as error:
-            self._show_sync_error("Kunne ikke arkivere melding", error)
-            return False
-
-        if archived:
-            self.sync_status_label.setText("Melding arkivert.")
-            self._reload_current_folder()
-        return archived
+        return self._start_task(
+            "Archiving message...",
+            lambda: self._mail_sync_service.archive_message(message_id),
+            lambda result: self._complete_task(
+                result, "Message archived.", reload=True
+            ),
+        )
 
     def _move_selected_message(self) -> bool:
         message_id = self._selected_message_id()
@@ -1608,11 +1740,11 @@ class MainWindow(QMainWindow):
         if not folders:
             return False
 
-        labels = [_folder_display_name(folder.name) for folder in folders]
+        labels = _folder_labels(folders)
         selected_label, accepted = QInputDialog.getItem(
             self,
-            "Flytt melding",
-            "Mappe",
+            "Move message",
+            "Folder",
             labels,
             0,
             False,
@@ -1621,64 +1753,257 @@ class MainWindow(QMainWindow):
             return False
 
         destination = folders[labels.index(selected_label)]
-        try:
-            moved = self._mail_sync_service.move_message_to_folder(
-                message_id,
-                destination.id,
-            )
-        except Exception as error:
-            self._show_sync_error("Kunne ikke flytte melding", error)
+        return self._start_task(
+            "Moving message...",
+            lambda: self._mail_sync_service.move_message_to_folder(
+                message_id, destination.id
+            ),
+            lambda result: self._complete_task(
+                result,
+                f"Message moved to {_folder_display_name(destination.name)}.",
+                reload=True,
+            ),
+        )
+
+    def _start_task(
+        self,
+        label: str,
+        operation: Callable[[], object],
+        success: Callable[[object], None],
+    ) -> bool:
+        if (
+            self._task_runner.busy
+            or self._sync_in_progress
+            or self._send_in_progress
+            or self._manual_sync_batch
+        ):
+            self.sync_status_label.setText("Wait for the current operation to finish.")
             return False
+        self.sync_status_label.setText(label)
+        return self._task_runner.start(operation, success, self._handle_task_error)
 
-        if moved:
-            self.sync_status_label.setText(
-                f"Melding flyttet til {_folder_display_name(destination.name)}."
-            )
+    def _handle_task_error(self, error: str) -> None:
+        self.sync_status_label.setText("The operation failed.")
+        attachment = self._selected_attachment()
+        if attachment is not None and not attachment.has_content:
+            self.attachment_preview.setHtml("<p>Could not fetch the attachment.</p>")
+        QMessageBox.warning(
+            self, "Operation failed", _friendly_error_message(error)
+        )
+
+    def _complete_task(
+        self, result: object, label: str, *, reload: bool = False
+    ) -> None:
+        self.sync_status_label.setText(
+            label if result else "The operation could not be completed."
+        )
+        if reload:
             self._reload_current_folder()
-        return moved
 
-    def _start_sync_worker(self, account_id: int) -> None:
-        self._set_sync_in_progress(True)
-        self.sync_status_label.setText("Synkroniserer...")
+    def _refresh_busy_actions(self, *_args: object) -> None:
+        self._set_account_actions_enabled(self._selected_account_id() is not None)
+        self._set_message_actions_enabled(self._selected_message_id() is not None)
+        self._set_compose_actions_enabled(bool(self._mail_store.list_accounts()))
+        self._update_attachment_actions()
+        if self._sync_queue and not self._task_runner.busy:
+            QTimer.singleShot(0, self._next_queued_sync)
 
-        thread = QThread(self)
-        worker = MailSyncWorker(self._mail_sync_service, account_id)
-        worker.moveToThread(thread)
+    def _toggle_auto_sync(self, enabled: bool) -> None:
+        self._preferences.setValue("sync/automatic", enabled)
+        if enabled:
+            self._sync_timer.start()
+        else:
+            self._sync_timer.stop()
+            if not self._manual_sync_batch:
+                self._sync_queue.clear()
 
-        thread.started.connect(worker.run)
-        worker.finished.connect(self._handle_sync_finished)
+    def _syncable_account_ids(self) -> list[int]:
+        return [
+            account.id
+            for account in self._mail_store.list_accounts()
+            if account.imap_host and account.provider != "tuta"
+        ]
+
+    def _queue_auto_sync(self) -> None:
+        if (
+            self._sync_in_progress
+            or self._send_in_progress
+            or self._sync_queue
+            or self._manual_sync_batch
+            or self._editing_account
+            or self._task_runner.busy
+        ):
+            return
+        self._sync_queue = self._syncable_account_ids()
+        self._sync_queue_failures.clear()
+        self._next_queued_sync()
+
+    def _next_queued_sync(self) -> None:
+        if self._sync_in_progress:
+            return
+        if self._send_in_progress or self._editing_account or self._task_runner.busy:
+            if not self._manual_sync_batch:
+                self._sync_queue.clear()
+            return
+        if not self._manual_sync_batch and not self.auto_sync_action.isChecked():
+            self._sync_queue.clear()
+            return
+        while self._sync_queue:
+            account_id = self._sync_queue.pop(0)
+            if self._mail_store.get_account(account_id) is not None:
+                self._start_sync_worker(
+                    account_id, background=not self._manual_sync_batch
+                )
+                return
+        if self._manual_sync_batch:
+            self._manual_sync_batch = False
+            failed_accounts = len(self._sync_queue_failures)
+            self.sync_status_label.setText(
+                "Sync completed with errors for "
+                f"{failed_accounts} account{'s' if failed_accounts != 1 else ''}."
+                if self._sync_queue_failures
+                else "All configured accounts have been synced."
+            )
+            self.sync_status_label.setToolTip("\n".join(self._sync_queue_failures))
+            self._refresh_busy_actions()
+            if self._sync_queue_failures:
+                QMessageBox.warning(
+                    self, "Sync completed with errors", "\n".join(self._sync_queue_failures)
+                )
+
+    def _fetch_older_messages(self) -> None:
+        account_id = self._selected_account_id()
+        if account_id is not None and not self._sync_in_progress:
+            self._start_sync_worker(account_id, fetch_older=True)
+
+    def _start_sync_worker(
+        self, account_id: int, *, fetch_older: bool = False, background: bool = False
+    ) -> bool:
+        if (
+            self._sync_in_progress
+            or self._task_runner.busy
+            or self._send_in_progress
+            or self._editing_account
+        ):
+            return False
+        account = self._mail_store.get_account(account_id)
+        if account is None:
+            return False
+        if account is not None and account.provider == "tuta":
+            worker = MailSyncWorker(
+                self._mail_sync_service,
+                account_id,
+                limit_per_folder=5,
+                message_folder_names=("INBOX",),
+                parent=self,
+            )
+        else:
+            worker = MailSyncWorker(
+                self._mail_sync_service,
+                account_id,
+                fetch_older=fetch_older,
+                parent=self,
+            )
+        worker.synced.connect(self._handle_sync_finished)
         worker.failed.connect(self._handle_sync_failed)
-        worker.done.connect(thread.quit)
-        worker.done.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(self._cleanup_sync_worker)
+        worker.cancelled.connect(self._handle_sync_cancelled)
+        worker.progress.connect(self._handle_sync_progress)
+        worker.finished.connect(self._cleanup_sync_worker)
 
-        self._sync_thread = thread
+        self._sync_thread = worker
         self._sync_worker = worker
-        thread.start()
+        self._sync_account_id = account_id
+        self._sync_account_label = account.display_name
+        self._background_sync = background
+        self._set_sync_in_progress(True)
+        self.sync_status_label.setText(f"Syncing {account.display_name}...")
+        self.sync_status_label.setToolTip("")
+        worker.start()
+        return True
+
+    def _handle_sync_progress(self, account_id: int, message: str) -> None:
+        if (
+            self._sync_worker is None
+            or self._sync_worker.isInterruptionRequested()
+            or account_id != self._sync_account_id
+        ):
+            return
+        status = f"{self._sync_account_label}: {message}"
+        self.sync_status_label.setText(status)
+        self.sync_status_label.setToolTip(status)
+
+    def _cancel_sync(self) -> None:
+        if self._sync_worker is None:
+            return
+        self._sync_queue.clear()
+        self._manual_sync_batch = False
+        self._sync_worker.requestInterruption()
+        self.cancel_sync_action.setEnabled(False)
+        self.sync_status_label.setText("Cancelling sync...")
+
+    def _handle_sync_cancelled(self, _account_id: int) -> None:
+        self._reload_current_folder()
+        self.sync_status_label.setText(
+            "Sync cancelled. Previously saved messages are kept."
+        )
+        self.sync_status_label.setToolTip("")
 
     def _handle_sync_finished(self, account_id: int, result: object) -> None:
         if not isinstance(result, HeaderSyncResult):
-            self.sync_status_label.setText("Synk fullført.")
+            self.sync_status_label.setText("Sync complete.")
             return
-        self._load_accounts(select_account_id=account_id)
+        if self._background_sync or self._manual_sync_batch:
+            self._reload_current_folder()
+        else:
+            self._load_accounts(select_account_id=account_id)
+        folder_label = "folder" if result.folders_seen == 1 else "folders"
+        message_label = "message" if result.messages_seen == 1 else "messages"
         self.sync_status_label.setText(
-            f"Synkroniserte {result.folders_seen} mapper og "
-            f"{result.messages_seen} meldinger."
+            f"Synced {result.folders_seen} {folder_label} and "
+            f"{result.messages_seen} {message_label}."
         )
+        if result.messages_failed:
+            failure_text = (
+                f"{result.messages_failed} "
+                f"message{'s' if result.messages_failed != 1 else ''} "
+                "could not be parsed."
+            )
+            if self._manual_sync_batch:
+                account = self._mail_store.get_account(account_id)
+                label = account.display_name if account is not None else "Account"
+                self._sync_queue_failures.append(f"{label}: {failure_text}")
+            self.sync_status_label.setText(
+                self.sync_status_label.text() + f" {failure_text}"
+            )
 
-    def _handle_sync_failed(self, _account_id: int, error_message: str) -> None:
-        self.sync_status_label.setText("Synk feilet")
+    def _handle_sync_failed(self, account_id: int, error_message: str) -> None:
+        self.sync_status_label.setText("Sync failed")
+        detail = _friendly_error_message(error_message)
+        account = self._mail_store.get_account(account_id)
+        account_label = account.display_name if account is not None else "Account"
+        self._sync_queue_failures.append(f"{account_label}: {detail}")
+        self.sync_status_label.setToolTip(detail)
+        if self._background_sync or self._manual_sync_batch:
+            return
         QMessageBox.warning(
             self,
-            "Synk feilet",
-            _friendly_error_message(error_message),
+            "Sync failed",
+            f"{account_label}: {detail}",
         )
 
     def _cleanup_sync_worker(self) -> None:
+        thread = self._sync_thread
+        if thread is not None:
+            # Retain the wrapper until native thread-local cleanup has finished.
+            thread.wait()
+            thread.deleteLater()
         self._sync_thread = None
         self._sync_worker = None
+        self._sync_account_id = None
+        self._sync_account_label = ""
         self._set_sync_in_progress(False)
+        self._background_sync = False
+        QTimer.singleShot(0, self._next_queued_sync)
 
     def _selected_account_id(self) -> int | None:
         current = self.account_list.currentItem()
@@ -1695,16 +2020,61 @@ class MainWindow(QMainWindow):
         return message_id if isinstance(message_id, int) else None
 
     def _set_account_actions_enabled(self, enabled: bool) -> None:
-        effective_enabled = enabled and not self._sync_in_progress
-        self.delete_account_button.setEnabled(effective_enabled)
-        self.test_imap_button.setEnabled(effective_enabled)
-        self.test_smtp_button.setEnabled(effective_enabled)
-        self.oauth_login_button.setEnabled(effective_enabled)
-        self.sync_account_button.setEnabled(effective_enabled)
-        self.sync_account_action.setEnabled(effective_enabled)
+        busy = (
+            self._sync_in_progress
+            or self._send_in_progress
+            or self._task_runner.busy
+            or self._manual_sync_batch
+        )
+        current = self.account_list.currentItem()
+        unified = (
+            current is not None
+            and current.data(Qt.ItemDataRole.UserRole) == UNIFIED_INBOX_ROLE
+        )
+        self.sync_account_action.setText(
+            "Syncing..."
+            if self._sync_in_progress
+            else "Sync all accounts"
+            if unified
+            else "Sync account"
+        )
+        self.sync_account_action.setEnabled(
+            not busy and (enabled or (unified and bool(self._syncable_account_ids())))
+        )
+        self.cancel_sync_action.setEnabled(
+            self._sync_worker is not None
+            and self._sync_in_progress
+            and not self._sync_worker.isInterruptionRequested()
+        )
+        self.add_account_action.setEnabled(not busy)
+        self.oauth_settings_action.setEnabled(not busy)
+        self.clear_attachment_cache_action.setEnabled(not busy)
+        for action in (
+            self.edit_account_action,
+            self.delete_account_action,
+            self.test_imap_action,
+            self.test_smtp_action,
+            self.oauth_login_action,
+            self.fetch_older_action,
+        ):
+            action.setEnabled(enabled and not busy)
 
     def _set_message_actions_enabled(self, enabled: bool) -> None:
+        enabled = (
+            enabled
+            and not self._sync_in_progress
+            and not self._task_runner.busy
+            and not self._manual_sync_batch
+        )
         effective_enabled = enabled and not self._send_in_progress
+        message_id = self._selected_message_id()
+        message = (
+            self._messages_by_id.get(message_id) if message_id is not None else None
+        )
+        account = self._mail_store.get_account(message.account_id) if message else None
+        can_archive = effective_enabled and (
+            account is None or account.provider != "tuta"
+        )
         self.reply_button.setEnabled(effective_enabled)
         self.forward_button.setEnabled(effective_enabled)
         self.reply_action.setEnabled(effective_enabled)
@@ -1713,900 +2083,37 @@ class MainWindow(QMainWindow):
         self.mark_unread_button.setEnabled(enabled)
         self.mark_read_action.setEnabled(enabled)
         self.mark_unread_action.setEnabled(enabled)
-        self.archive_button.setEnabled(effective_enabled)
+        self.archive_button.setEnabled(bool(can_archive))
         self.trash_button.setEnabled(effective_enabled)
         self.move_button.setEnabled(effective_enabled)
-        self.archive_action.setEnabled(effective_enabled)
+        self.archive_action.setEnabled(bool(can_archive))
         self.trash_action.setEnabled(effective_enabled)
         self.move_action.setEnabled(effective_enabled)
 
     def _set_compose_actions_enabled(self, enabled: bool) -> None:
-        effective_enabled = enabled and not self._send_in_progress
+        effective_enabled = (
+            enabled
+            and not self._send_in_progress
+            and not self._task_runner.busy
+            and not self._manual_sync_batch
+        )
         self.compose_button.setEnabled(effective_enabled)
         self.compose_action.setEnabled(effective_enabled)
 
     def _set_send_in_progress(self, in_progress: bool) -> None:
         self._send_in_progress = in_progress
-        self.compose_button.setText("Sender..." if in_progress else "Ny")
+        self._set_account_actions_enabled(self._selected_account_id() is not None)
+        self.compose_button.setText("Sending..." if in_progress else "New")
         self._set_compose_actions_enabled(bool(self._mail_store.list_accounts()))
         self._set_message_actions_enabled(self._selected_message_id() is not None)
+        self._update_attachment_actions()
 
     def _set_sync_in_progress(self, in_progress: bool) -> None:
         self._sync_in_progress = in_progress
-        self.sync_account_button.setText("Synker..." if in_progress else "Synk")
         self._set_account_actions_enabled(self._selected_account_id() is not None)
+        self._set_message_actions_enabled(self._selected_message_id() is not None)
+        self._update_attachment_actions()
 
     def _show_sync_error(self, title: str, error: Exception) -> None:
         self.sync_status_label.setText(title)
         QMessageBox.warning(self, title, _friendly_error_message(error))
-
-
-def _folder_sort_key(name: str) -> tuple[int, str]:
-    preferred_order = {
-        "innboks": 0,
-        "inbox": 0,
-        "sendt": 4,
-        "sent": 4,
-        "sent mail": 4,
-        "spam": 90,
-        "junk": 90,
-        "søppelpost": 90,
-        "papirkurv": 99,
-        "trash": 99,
-        "deleted items": 99,
-    }
-    normalized_name = _normalized_folder_name(name)
-    return (preferred_order.get(normalized_name, 100), normalized_name)
-
-
-def _configure_message_item(item: QListWidgetItem, message: Message) -> None:
-    font = QFont()
-    font.setBold(not message.is_read)
-    item.setFont(font)
-    item.setToolTip(message.body_preview)
-
-
-def _toolbar_button(
-    text: str,
-    icon_name: str,
-    tooltip: str,
-    object_name: str,
-) -> QToolButton:
-    button = QToolButton()
-    button.setObjectName(object_name)
-    button.setText(text)
-    button.setToolTip(tooltip)
-    button.setIcon(QIcon.fromTheme(icon_name))
-    button.setIconSize(QSize(18, 18))
-    button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-    button.setAutoRaise(False)
-    button.setFixedHeight(40)
-    button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-    return button
-
-
-def _clear_layout(layout: QHBoxLayout) -> None:
-    while layout.count():
-        item = layout.takeAt(0)
-        widget = item.widget()
-        if widget is not None:
-            widget.setParent(layout.parentWidget())
-
-
-def _set_widget_property(widget: QWidget, name: str, value: object) -> None:
-    widget.setProperty(name, value)
-    widget.style().unpolish(widget)
-    widget.style().polish(widget)
-    widget.update()
-
-
-def _single_row_toolbar_width(window: MainWindow) -> int:
-    controls = (
-        window.compose_button,
-        window.reply_button,
-        window.forward_button,
-        window.archive_button,
-        window.trash_button,
-        window.move_button,
-        window.mark_read_button,
-        window.mark_unread_button,
-        window.remote_content_checkbox,
-    )
-    controls_width = sum(control.sizeHint().width() for control in controls)
-    spacings_width = 6 * (len(controls) - 1) + 16
-    margins_width = 16
-    buffer_width = 24
-    return controls_width + spacings_width + margins_width + buffer_width
-
-
-def _button_chain_toolbar_width(window: MainWindow) -> int:
-    buttons = (
-        window.compose_button,
-        window.reply_button,
-        window.forward_button,
-        window.archive_button,
-        window.trash_button,
-        window.move_button,
-        window.mark_read_button,
-        window.mark_unread_button,
-    )
-    buttons_width = sum(button.sizeHint().width() for button in buttons)
-    spacings_width = 6 * (len(buttons) - 1) + 8
-    margins_width = 16
-    buffer_width = 24
-    return buttons_width + spacings_width + margins_width + buffer_width
-
-
-def _reordered_columns(
-    order: tuple[str, ...],
-    source_column: str,
-    target_column: str,
-    *,
-    insert_after_target: bool,
-) -> tuple[str, ...]:
-    remaining = [column for column in order if column != source_column]
-    target_index = remaining.index(target_column)
-    insert_index = target_index + 1 if insert_after_target else target_index
-    remaining.insert(insert_index, source_column)
-    return tuple(remaining)
-
-
-def _event_button(event: object) -> Qt.MouseButton:
-    button = getattr(event, "button")()
-    return button
-
-
-def _event_position(event: object) -> QPoint:
-    position = getattr(event, "position")()
-    return position.toPoint()
-
-
-def _event_global_position(event: object) -> QPoint:
-    global_position = getattr(event, "globalPosition")()
-    return global_position.toPoint()
-
-
-def _message_sender_label(message: Message) -> str:
-    sender = message.sender.strip()
-    if sender:
-        return sender
-    recipients = message.recipients.strip()
-    if recipients:
-        return f"Til {recipients}"
-    return "(ukjent)"
-
-
-def _compact_message_item_text(
-    sender: str,
-    subject: str,
-    preview: str,
-    *,
-    account_label: str | None = None,
-) -> str:
-    lines = []
-    if account_label and account_label.casefold() != sender.casefold():
-        lines.append(account_label)
-    lines.append(sender)
-    lines.append(subject)
-    if preview:
-        lines.append(preview)
-    return "\n".join(lines)
-
-
-def _message_matches_filters(
-    message: Message,
-    query: str,
-    unread_only: bool,
-) -> bool:
-    if unread_only and message.is_read:
-        return False
-    if not query:
-        return True
-
-    searchable = " ".join(
-        [
-            message.subject,
-            message.sender,
-            message.recipients,
-            message.body_preview,
-        ]
-    ).casefold()
-    return query in searchable
-
-
-def _sort_messages(messages: list[Message], sort_key: object) -> list[Message]:
-    if sort_key == "date_asc":
-        return sorted(messages, key=_message_date_value)
-    if sort_key == "sender":
-        return sorted(messages, key=lambda message: message.sender.casefold())
-    if sort_key == "subject":
-        return sorted(messages, key=lambda message: message.subject.casefold())
-    return sorted(messages, key=_message_date_value, reverse=True)
-
-
-def _message_date_value(message: Message) -> str:
-    return message.received_at or message.sent_at or ""
-
-
-def _short_message_date(message: Message) -> str:
-    value = _message_date_value(message)
-    if not value:
-        return ""
-    if "T" in value:
-        return value.split("T", maxsplit=1)[0]
-    return value[:16]
-
-
-def _folder_display_name(name: str) -> str:
-    normalized_name = _normalized_folder_name(name)
-    display_names = {
-        "inbox": "Innboks",
-        "innboks": "Innboks",
-        "sent": "Sendt",
-        "sent mail": "Sendt",
-        "sendt": "Sendt",
-        "trash": "Papirkurv",
-        "papirkurv": "Papirkurv",
-        "deleted items": "Papirkurv",
-        "spam": "Søppelpost",
-        "junk": "Søppelpost",
-        "søppelpost": "Søppelpost",
-    }
-    return display_names.get(normalized_name, name.rsplit("/", maxsplit=1)[-1])
-
-
-def _is_core_folder(name: str, remote_id: str | None = None) -> bool:
-    aliases = _folder_aliases(name)
-    if remote_id:
-        aliases.update(_folder_aliases(remote_id))
-    return bool(
-        aliases
-        & {
-            "inbox",
-            "innboks",
-            "sent",
-            "sent mail",
-            "sendt",
-            "spam",
-            "junk",
-            "søppelpost",
-            "trash",
-            "papirkurv",
-            "deleted items",
-        }
-    )
-
-
-def _folder_aliases(name: str) -> set[str]:
-    normalized = _normalized_folder_name(name)
-    aliases = {name.casefold(), normalized}
-    if normalized in {"inbox", "innboks"}:
-        aliases.update({"inbox", "innboks"})
-    elif normalized in {"sent", "sent mail", "sendt"}:
-        aliases.update({"sent", "sent mail", "sendt"})
-    elif normalized in {"spam", "junk", "søppelpost"}:
-        aliases.update({"spam", "junk", "søppelpost"})
-    elif normalized in {"trash", "papirkurv", "deleted items"}:
-        aliases.update({"trash", "papirkurv", "deleted items"})
-    return aliases
-
-
-def _friendly_error_message(error: Exception | str) -> str:
-    if isinstance(error, str):
-        return error or "Ukjent feil."
-    if isinstance(error, smtplib.SMTPAuthenticationError):
-        return "SMTP-innlogging feilet. Sjekk konto/OAuth og prøv igjen."
-    if isinstance(error, smtplib.SMTPRecipientsRefused):
-        return "SMTP-serveren avviste mottakeren."
-    if isinstance(error, smtplib.SMTPException):
-        return f"SMTP-feil: {error}"
-    if isinstance(error, OAuthCallbackError):
-        return f"OAuth-feil: {error}"
-    if isinstance(error, TimeoutError):
-        return "Tilkoblingen tok for lang tid."
-    if isinstance(error, OSError):
-        return f"Nettverksfeil: {error}"
-    return str(error) or error.__class__.__name__
-
-
-def _send_status_text(result: SendResult) -> str:
-    if not result.server_copy_attempted:
-        return "E-post sendt. Sendt-kopi håndteres av mailserveren."
-    if result.server_copy_saved:
-        return "E-post sendt og lagret i Sendt."
-    return "E-post sendt, men serverkopi til Sendt feilet."
-
-
-def _format_attachment_size(size: int) -> str:
-    if size < 1024:
-        return f"{size} B"
-    if size < 1024 * 1024:
-        return f"{size / 1024:.1f} KB"
-    return f"{size / (1024 * 1024):.1f} MB"
-
-
-def _attachment_preview_html(attachment: Attachment, content: bytes) -> str:
-    escaped_name = _html_escape(attachment.filename)
-    escaped_type = _html_escape(attachment.content_type)
-    size = _format_attachment_size(len(content))
-    summary = (
-        f"<p><strong>{escaped_name}</strong><br>"
-        f"{_html_escape(_display_content_type(attachment.content_type))}, {size}</p>"
-    )
-
-    if attachment.content_type.startswith("image/"):
-        encoded = base64.b64encode(content).decode("ascii")
-        return (
-            summary
-            +
-            f'<img src="data:{escaped_type};base64,{encoded}" '
-            'style="max-width: 100%; max-height: 130px;">'
-        )
-
-    if attachment.content_type.startswith("text/"):
-        return (
-            summary
-            +
-            f"<pre>{_html_escape(_decode_preview_text(content))}</pre>"
-        )
-
-    if (
-        attachment.content_type == "application/pdf"
-        or attachment.filename.casefold().endswith(".pdf")
-    ):
-        page_count = _guess_pdf_page_count(content)
-        page_text = f"{page_count} sider" if page_count is not None else "PDF-dokument"
-        return (
-            summary
-            +
-            f"<p>{page_text}. Bruk Åpne for å forhåndsvise i PDF-leseren, "
-            "eller Lagre som hvis du vil beholde filen.</p>"
-        )
-
-    return (
-        summary
-        +
-        "<p>Direkte forhåndsvisning støttes ikke for denne filtypen. "
-        "Bruk Åpne eller Lagre som.</p>"
-    )
-
-
-def _attachment_type_label(attachment: Attachment) -> str:
-    content_type = attachment.content_type.casefold()
-    filename = attachment.filename.casefold()
-    if content_type.startswith("image/"):
-        return "[BILDE]"
-    if content_type == "application/pdf" or filename.endswith(".pdf"):
-        return "[PDF]"
-    if content_type.startswith("text/"):
-        return "[TEKST]"
-    if content_type.startswith("audio/"):
-        return "[LYD]"
-    if content_type.startswith("video/"):
-        return "[VIDEO]"
-    if "zip" in content_type or filename.endswith((".zip", ".tar", ".gz")):
-        return "[ARKIV]"
-    return "[FIL]"
-
-
-def _display_content_type(content_type: str) -> str:
-    labels = {
-        "application/pdf": "PDF",
-        "application/zip": "ZIP-arkiv",
-        "text/plain": "Tekst",
-        "text/html": "HTML",
-        "image/jpeg": "JPEG-bilde",
-        "image/png": "PNG-bilde",
-        "image/gif": "GIF-bilde",
-    }
-    return labels.get(content_type.casefold(), content_type)
-
-
-def _guess_pdf_page_count(content: bytes) -> int | None:
-    if not content.startswith(b"%PDF"):
-        return None
-    matches = set()
-    for match in re.finditer(rb"/Type\s*/Page\b", content):
-        matches.add(match.start())
-    if not matches:
-        return None
-    return len(matches)
-
-
-def _decode_preview_text(content: bytes, max_length: int = 8000) -> str:
-    preview = content[:max_length]
-    for encoding in ("utf-8", "latin-1"):
-        try:
-            text = preview.decode(encoding)
-            break
-        except UnicodeDecodeError:
-            continue
-    else:
-        text = preview.decode("utf-8", errors="replace")
-
-    if len(content) > max_length:
-        text += "\n\n..."
-    return text
-
-
-def _html_escape(value: str) -> str:
-    return (
-        value.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
-    )
-
-
-def _safe_filename(filename: str) -> str:
-    safe_characters = []
-    for character in filename:
-        if character.isalnum() or character in {" ", ".", "-", "_"}:
-            safe_characters.append(character)
-        else:
-            safe_characters.append("_")
-
-    safe_name = "".join(safe_characters).strip(" .")
-    return safe_name or "vedlegg"
-
-
-def _unique_attachment_path(directory: Path, filename: str) -> Path:
-    path = directory / filename
-    if not path.exists():
-        return path
-
-    stem = path.stem or "vedlegg"
-    suffix = path.suffix
-    counter = 2
-    while True:
-        candidate = directory / f"{stem} ({counter}){suffix}"
-        if not candidate.exists():
-            return candidate
-        counter += 1
-
-
-def _normalized_folder_name(name: str) -> str:
-    return name.rsplit("/", maxsplit=1)[-1].casefold()
-
-
-def _apply_provider_defaults(
-    provider: str,
-    imap_host: str | None,
-    imap_port: int | None,
-    imap_security: str,
-    smtp_host: str | None,
-    smtp_port: int | None,
-    smtp_security: str,
-) -> tuple[str, int, str, str, int, str]:
-    defaults = get_mail_provider_defaults(provider)
-    return (
-        imap_host or defaults.imap_host,
-        imap_port or defaults.imap_port,
-        imap_security or defaults.imap_security,
-        smtp_host or defaults.smtp_host,
-        smtp_port or defaults.smtp_port,
-        smtp_security or defaults.smtp_security,
-    )
-
-
-_MAIN_WINDOW_STYLESHEET = """
-QMainWindow {
-    background: #f4f7fa;
-    color: #232629;
-    font-family: "Noto Sans", "Inter", "Segoe UI", sans-serif;
-    font-size: 10pt;
-}
-
-QMenuBar {
-    background: #ffffff;
-    border-bottom: 1px solid #d7e0ea;
-    padding: 3px 8px;
-}
-
-QMenuBar::item {
-    border-radius: 6px;
-    padding: 6px 10px;
-}
-
-QMenuBar::item:selected {
-    background: #e7f4fd;
-    color: #232629;
-}
-
-QSplitter::handle {
-    background: #d7e0ea;
-    width: 1px;
-}
-
-QWidget#folder_panel {
-    background: #edf3f8;
-    border-right: 1px solid #d7e0ea;
-}
-
-QWidget#message_list_panel,
-QWidget#message_view_panel {
-    background: #f8fafc;
-}
-
-QWidget#message_list_panel {
-    border-left: 1px solid #d7e0ea;
-}
-
-QWidget#message_view_panel {
-    background: #f8fafc;
-}
-
-QWidget#folder_panel[dragSource="true"],
-QWidget#message_view_panel[dragSource="true"],
-QWidget#message_list_panel[dragSource="true"] {
-    background: #eef8fd;
-}
-
-QWidget#folder_panel[dropPreview="before"],
-QWidget#message_view_panel[dropPreview="before"],
-QWidget#message_list_panel[dropPreview="before"] {
-    border-left: 5px solid #3daee9;
-    background: #eaf8ff;
-}
-
-QWidget#folder_panel[dropPreview="after"],
-QWidget#message_view_panel[dropPreview="after"],
-QWidget#message_list_panel[dropPreview="after"] {
-    border-right: 5px solid #3daee9;
-    background: #eaf8ff;
-}
-
-QWidget#message_toolbar {
-    background: #ffffff;
-    border: 1px solid #d7e0ea;
-    border-radius: 8px;
-}
-
-QWidget#account_tools_panel {
-    background: #f8fbfd;
-    border: 1px solid #d7e0ea;
-    border-radius: 8px;
-    margin: 2px 0 6px;
-}
-
-QWidget#message_filter_bar {
-    background: #ffffff;
-    border: 1px solid #d7e0ea;
-    border-radius: 8px;
-    padding: 5px;
-}
-
-QLabel#app_title {
-    color: #232629;
-    font-size: 20px;
-    font-weight: 700;
-    padding: 2px 6px 4px;
-}
-
-QLabel#folder_panel_title,
-QLabel#account_panel_title,
-QLabel#message_list_title {
-    color: #52616f;
-    font-size: 13px;
-    font-weight: 600;
-    padding: 8px 6px 2px;
-}
-
-QLabel#column_drag_handle_folders,
-QLabel#column_drag_handle_reader,
-QLabel#column_drag_handle_messages {
-    background: #ffffff;
-    border: 1px solid #d7e0ea;
-    border-radius: 8px;
-    color: #52616f;
-    font-size: 12px;
-    font-weight: 700;
-    min-height: 28px;
-    padding: 5px 10px;
-}
-
-QLabel#column_drag_handle_folders[dragging="true"],
-QLabel#column_drag_handle_reader[dragging="true"],
-QLabel#column_drag_handle_messages[dragging="true"] {
-    background: #dff2fc;
-    border: 1px solid #3daee9;
-    color: #14384b;
-}
-
-QLabel#column_drag_handle_folders[dropPreview="before"],
-QLabel#column_drag_handle_reader[dropPreview="before"],
-QLabel#column_drag_handle_messages[dropPreview="before"] {
-    background: #e7f7ff;
-    border-left: 5px solid #3daee9;
-    color: #14384b;
-}
-
-QLabel#column_drag_handle_folders[dropPreview="after"],
-QLabel#column_drag_handle_reader[dropPreview="after"],
-QLabel#column_drag_handle_messages[dropPreview="after"] {
-    background: #e7f7ff;
-    border-right: 5px solid #3daee9;
-    color: #14384b;
-}
-
-QListWidget#account_list,
-QListWidget#folder_list,
-QListWidget#message_list,
-QListWidget#attachment_list {
-    background: transparent;
-    border: 0;
-    color: #232629;
-    outline: 0;
-}
-
-QListWidget#account_list::item,
-QListWidget#folder_list::item {
-    border-radius: 6px;
-    margin: 2px 6px;
-    min-height: 30px;
-    padding: 6px 10px;
-}
-
-QListWidget#account_list::item:hover,
-QListWidget#folder_list::item:hover {
-    background: #e1eaf2;
-}
-
-QListWidget#account_list::item:selected,
-QListWidget#folder_list::item:selected {
-    background: #dff2fc;
-    border-left: 3px solid #3daee9;
-    color: #14384b;
-}
-
-QListWidget#message_list {
-    background: transparent;
-    border: 0;
-    border-radius: 8px;
-}
-
-QListWidget#message_list::item {
-    background: #ffffff;
-    border: 1px solid #dfe7ef;
-    border-radius: 8px;
-    margin: 5px 2px;
-    min-height: 96px;
-}
-
-QListWidget#message_list::item:hover {
-    background: #f8fcff;
-    border: 1px solid #9fcde8;
-}
-
-QListWidget#message_list::item:selected {
-    background: #dff2fc;
-    border: 1px solid #3daee9;
-    color: #14384b;
-}
-
-QWidget#message_item_card {
-    background: transparent;
-}
-
-QLabel#message_item_account {
-    color: #22769f;
-    font-size: 11px;
-    font-weight: 600;
-}
-
-QLabel#message_item_sender {
-    color: #1f2933;
-    font-size: 13px;
-    font-weight: 700;
-}
-
-QLabel#message_item_date {
-    color: #7b8794;
-    font-size: 11px;
-}
-
-QLabel#message_item_subject {
-    color: #232629;
-    font-size: 13px;
-    font-weight: 600;
-}
-
-QLabel#message_item_preview {
-    color: #627282;
-    font-size: 12px;
-}
-
-QListWidget#attachment_list {
-    background: #ffffff;
-    border: 1px solid #d7e0ea;
-    border-radius: 6px;
-    margin: 0;
-}
-
-QListWidget#attachment_list::item {
-    border-radius: 4px;
-    margin: 2px;
-    min-height: 28px;
-    padding: 6px 8px;
-}
-
-QListWidget#attachment_list::item:selected {
-    background: #d8edf9;
-    color: #14384b;
-}
-
-QTextBrowser#attachment_preview {
-    background: #ffffff;
-    border: 1px solid #d7e0ea;
-    border-radius: 6px;
-    color: #232629;
-    margin: 0;
-    padding: 8px;
-}
-
-QLineEdit,
-QComboBox {
-    background: #ffffff;
-    border: 1px solid #b8c6d3;
-    border-radius: 6px;
-    color: #232629;
-    min-height: 30px;
-    padding: 4px 8px;
-    selection-background-color: #3daee9;
-}
-
-QLineEdit#message_search_edit {
-    border-radius: 8px;
-    min-height: 34px;
-}
-
-QLineEdit:focus,
-QComboBox:focus {
-    border: 1px solid #3daee9;
-}
-
-QComboBox::drop-down {
-    border: 0;
-    width: 24px;
-}
-
-QCheckBox {
-    color: #4b5563;
-    padding: 4px 8px;
-}
-
-QCheckBox#remote_content_checkbox {
-    background: #f8fbfd;
-    border: 1px solid #d7e0ea;
-    border-radius: 8px;
-    color: #31546c;
-    min-width: 136px;
-    padding: 6px 10px;
-}
-
-QCheckBox::indicator {
-    background: #ffffff;
-    border: 1px solid #9aa8b5;
-    border-radius: 4px;
-    height: 15px;
-    width: 15px;
-}
-
-QCheckBox::indicator:checked {
-    background: #3daee9;
-    border: 1px solid #2586bd;
-}
-
-QPushButton {
-    background: #ffffff;
-    border: 1px solid #b8c6d3;
-    border-radius: 6px;
-    color: #232629;
-    font-weight: 500;
-    min-height: 30px;
-    padding: 4px 10px;
-}
-
-QPushButton#compose_button {
-    min-height: 30px;
-}
-
-QPushButton:hover {
-    background: #e7f4fd;
-    border: 1px solid #3daee9;
-}
-
-QPushButton:pressed {
-    background: #cbe7f7;
-}
-
-QPushButton:disabled {
-    background: #eef2f6;
-    border: 1px solid #d7dee7;
-    color: #9aa8b5;
-}
-
-QToolButton {
-    background: #ffffff;
-    border: 1px solid #b8c6d3;
-    border-radius: 7px;
-    color: #232629;
-    font-weight: 600;
-    min-height: 32px;
-    min-width: 68px;
-    padding: 5px 8px;
-}
-
-QToolButton:hover {
-    background: #eaf6fd;
-    border: 1px solid #3daee9;
-}
-
-QToolButton:pressed {
-    background: #cfeaf8;
-}
-
-QToolButton:disabled {
-    background: #f1f4f7;
-    border: 1px solid #d7dee7;
-    color: #9aa8b5;
-}
-
-QToolButton#compose_button {
-    background: #3daee9;
-    border: 1px solid #2586bd;
-    color: #ffffff;
-    min-width: 72px;
-}
-
-QToolButton#forward_button {
-    min-width: 96px;
-}
-
-QToolButton#mark_read_button,
-QToolButton#mark_unread_button {
-    min-width: 60px;
-}
-
-QToolButton#compose_button:hover {
-    background: #45b8f2;
-}
-
-QToolButton#trash_button {
-    color: #8f3a38;
-}
-
-QLabel#sync_status_label {
-    color: #31546c;
-    font-size: 12px;
-    margin: 0 6px;
-    padding: 0 2px;
-}
-
-QWidget#message_view {
-    background: #ffffff;
-    border: 1px solid #d7e0ea;
-    border-radius: 8px;
-}
-
-QScrollBar:vertical {
-    background: transparent;
-    margin: 4px 2px 4px 0;
-    width: 10px;
-}
-
-QScrollBar::handle:vertical {
-    background: #c4d1dd;
-    border-radius: 5px;
-    min-height: 28px;
-}
-
-QScrollBar::handle:vertical:hover {
-    background: #9fb4c7;
-}
-
-QScrollBar::add-line:vertical,
-QScrollBar::sub-line:vertical {
-    height: 0;
-}
-"""

@@ -10,6 +10,8 @@ CREATE TABLE IF NOT EXISTS accounts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     display_name TEXT NOT NULL,
     email_address TEXT NOT NULL UNIQUE,
+    provider TEXT NOT NULL DEFAULT 'imap',
+    local_certificate TEXT,
     auth_method TEXT NOT NULL DEFAULT 'password'
         CHECK (auth_method IN ('password', 'oauth2')),
     oauth_provider TEXT
@@ -47,12 +49,16 @@ CREATE TABLE IF NOT EXISTS messages (
     subject TEXT NOT NULL DEFAULT '',
     sender TEXT NOT NULL DEFAULT '',
     recipients TEXT NOT NULL DEFAULT '',
+    reply_to TEXT NOT NULL DEFAULT '',
+    in_reply_to TEXT NOT NULL DEFAULT '',
+    "references" TEXT NOT NULL DEFAULT '',
     sent_at TEXT,
     received_at TEXT,
     is_read INTEGER NOT NULL DEFAULT 0 CHECK (is_read IN (0, 1)),
     body_preview TEXT NOT NULL DEFAULT '',
     body_text TEXT NOT NULL DEFAULT '',
     body_html TEXT NOT NULL DEFAULT '',
+    body_fetch_failed INTEGER NOT NULL DEFAULT 0 CHECK (body_fetch_failed IN (0, 1)),
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (account_id) REFERENCES accounts (id) ON DELETE CASCADE,
     FOREIGN KEY (folder_id) REFERENCES folders (id) ON DELETE CASCADE,
@@ -66,6 +72,7 @@ CREATE TABLE IF NOT EXISTS folder_sync_state (
     account_id INTEGER NOT NULL,
     folder_id INTEGER NOT NULL,
     last_seen_uid INTEGER NOT NULL DEFAULT 0,
+    uidvalidity INTEGER,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (account_id, folder_id),
     FOREIGN KEY (account_id) REFERENCES accounts (id) ON DELETE CASCADE,
@@ -73,6 +80,15 @@ CREATE TABLE IF NOT EXISTS folder_sync_state (
     FOREIGN KEY (folder_id, account_id) REFERENCES folders (id, account_id)
         ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS message_references (
+    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    reference_id TEXT NOT NULL,
+    PRIMARY KEY (message_id, reference_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_message_references_reference_id
+ON message_references(reference_id, message_id);
 
 CREATE TABLE IF NOT EXISTS attachments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -83,6 +99,8 @@ CREATE TABLE IF NOT EXISTS attachments (
     content_id TEXT,
     is_inline INTEGER NOT NULL DEFAULT 0 CHECK (is_inline IN (0, 1)),
     content BLOB,
+    imap_section TEXT,
+    accessed_at TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (message_id) REFERENCES messages (id) ON DELETE CASCADE
 );
@@ -98,3 +116,11 @@ ON messages (received_at);
 
 CREATE INDEX IF NOT EXISTS idx_attachments_message_id
 ON attachments (message_id);
+
+CREATE TABLE IF NOT EXISTS drafts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    payload TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'draft' CHECK (state IN ('draft', 'sending', 'uncertain', 'sent')),
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);

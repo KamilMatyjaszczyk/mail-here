@@ -347,20 +347,20 @@ class _OAuthCallbackHandler(BaseHTTPRequestHandler):
         if error is not None:
             description = _first_query_value(query, "error_description") or error
             self.server.callback_error = OAuthCallbackError(description)
-            self._send_text_response(400, "OAuth innlogging feilet.")
+            self._send_text_response(400, "OAuth sign-in failed.")
             return
 
         code = _first_query_value(query, "code")
         state = _first_query_value(query, "state")
         if code is None or state is None:
             self.server.callback_error = OAuthCallbackError(
-                "OAuth callback manglet code eller state"
+                "OAuth callback was missing code or state"
             )
-            self._send_text_response(400, "OAuth callback manglet data.")
+            self._send_text_response(400, "OAuth callback data was missing.")
             return
 
         self.server.callback_result = OAuthCallbackResult(code=code, state=state)
-        self._send_text_response(200, "OAuth innlogging er ferdig.")
+        self._send_text_response(200, "OAuth sign-in complete.")
 
     def log_message(self, _format: str, *_args: object) -> None:
         return

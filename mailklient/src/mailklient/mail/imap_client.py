@@ -6,14 +6,17 @@ import base64
 import html
 import imaplib
 import re
-import ssl
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, suppress
+from dataclasses import replace
 from email import message_from_bytes
 from email.header import decode_header, make_header
 from email.message import Message
 from email.policy import default
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
+
+from imapclient.exceptions import ProtocolError
 
 from mailklient.mail.config import (
     ImapAttachment,
@@ -22,11 +25,22 @@ from mailklient.mail.config import (
     ImapMessageHeader,
     ImapSettings,
 )
+from mailklient.mail.imap_parts import (
+    MessageMissingError,
+    fetch_fields,
+    fetch_part,
+    mime_parts,
+)
 from mailklient.security import build_xoauth2_payload
+from mailklient.security.tls import create_mail_ssl_context
 
 ImapConnectionFactory = Callable[..., imaplib.IMAP4_SSL]
 PlainImapConnectionFactory = Callable[..., imaplib.IMAP4]
 MAX_AUTO_CACHED_ATTACHMENT_BYTES = 5 * 1024 * 1024
+
+
+class ImapAuthenticationError(imaplib.IMAP4.error):
+    """The server rejected authentication, without exposing its raw reply."""
 
 
 class ImapClient:
@@ -41,11 +55,76 @@ class ImapClient:
         self._settings = settings
         self._connection_factory = connection_factory
         self._starttls_connection_factory = starttls_connection_factory
+        self._expected_validity: dict[str, int] = {}
+        self._shared_connection: imaplib.IMAP4 | None = None
+        self._progress: Callable[[str], None] | None = None
+
+    def set_progress_callback(self, callback: Callable[[str], None]) -> None:
+        self._progress = callback
+
+    def _report_progress(self, message: str) -> None:
+        if self._progress is not None:
+            self._progress(message)
+
+    @contextmanager
+    def session(self) -> Iterator[None]:
+        """Keep one authenticated connection for a complete sync."""
+        if self._shared_connection is not None:
+            raise RuntimeError("An IMAP session is already active.")
+        connection = self._login()
+        self._shared_connection = connection
+        try:
+            yield
+        except BaseException:
+            # A cancelled or timed-out command must not wait for LOGOUT too.
+            with suppress(Exception):
+                connection.shutdown()
+            raise
+        else:
+            try:
+                connection.logout()
+            except Exception:
+                with suppress(Exception):
+                    connection.shutdown()
+        finally:
+            self._shared_connection = None
+
+    def _release_connection(self, connection) -> None:
+        if connection is not self._shared_connection:
+            connection.logout()
+
+    def expect_uidvalidity(self, folder_name: str, validity: int) -> None:
+        self._expected_validity[folder_name] = validity
+
+    def _select(self, connection, folder_name: str, readonly: bool = False):
+        self._report_progress(f"Opening {folder_name}...")
+        result = connection.select(_quote_mailbox(folder_name), readonly=readonly)
+        expected = self._expected_validity.get(folder_name)
+        if result[0] == "OK" and expected is not None:
+            if _selected_uidvalidity(connection) != expected:
+                raise ValueError(
+                    "The folder has changed on the server. Sync before trying again."
+                )
+        return result
+
+    def folder_uidvalidity(self, folder_name: str) -> int:
+        connection = self._login()
+        try:
+            if self._select(connection, folder_name, readonly=True)[0] != "OK":
+                raise ValueError("Could not open the IMAP folder.")
+            return _selected_uidvalidity(connection)
+        finally:
+            self._release_connection(connection)
 
     def test_connection(self) -> bool:
         """Connect with SSL, login, logout and report success."""
         connection = self._login()
-        connection.logout()
+        try:
+            self._release_connection(connection)
+        except Exception:
+            with suppress(Exception):
+                connection.shutdown()
+            raise
         return True
 
     def list_folders(self) -> list[ImapFolder]:
@@ -64,7 +143,7 @@ class ImapClient:
                 if folder is not None
             ]
         finally:
-            connection.logout()
+            self._release_connection(connection)
 
     def fetch_headers(
         self,
@@ -74,8 +153,9 @@ class ImapClient:
         """Fetch recent message headers from one folder."""
         connection = self._login()
         try:
-            status, data = connection.select(
-                _quote_mailbox(folder_name),
+            status, data = self._select(
+                connection,
+                folder_name,
                 readonly=True,
             )
             if status != "OK":
@@ -114,7 +194,7 @@ class ImapClient:
 
             return list(reversed(headers))
         finally:
-            connection.logout()
+            self._release_connection(connection)
 
     def fetch_headers_since_uid(
         self,
@@ -125,8 +205,9 @@ class ImapClient:
         """Fetch message headers newer than the last synced IMAP UID."""
         connection = self._login()
         try:
-            status, _data = connection.select(
-                _quote_mailbox(folder_name),
+            status, _data = self._select(
+                connection,
+                folder_name,
                 readonly=True,
             )
             if status != "OK":
@@ -177,14 +258,187 @@ class ImapClient:
 
             return list(reversed(headers))
         finally:
-            connection.logout()
+            self._release_connection(connection)
+
+    def fetch_attachment(
+        self, folder_name: str, message_uid: str, index: int
+    ) -> ImapAttachment:
+        """Fetch an uncached attachment, without marking its message as read."""
+        _validate_uid(message_uid)
+        if index < 0:
+            raise ValueError("Invalid attachment.")
+        connection = self._login()
+        try:
+            if self._select(connection, folder_name, readonly=True)[0] != "OK":
+                raise ValueError("Could not open the attachment folder.")
+            fields = fetch_fields(connection, message_uid, "(UID BODYSTRUCTURE)")
+            parts = [
+                part
+                for part in mime_parts(fields[b"BODYSTRUCTURE"])
+                if part.is_attachment
+            ]
+            if index >= len(parts):
+                raise ValueError("The attachment does not exist in this message.")
+            part = parts[index]
+            message, content = fetch_part(connection, message_uid, part)
+            return ImapAttachment(
+                filename=_decode_header_value(message.get_filename()) or "(unnamed)",
+                content_type=message.get_content_type(),
+                size=len(content),
+                content_id=str(message.get("Content-ID", "")).strip("<>") or None,
+                is_inline=message.get_content_disposition() == "inline",
+                content=content,
+                imap_section=part.section,
+            )
+        finally:
+            with suppress(Exception):
+                self._release_connection(connection)
+
+    def fetch_messages(
+        self,
+        folder_name: str,
+        *,
+        limit: int = 25,
+        after_uid: int = 0,
+        before_uid: int | None = None,
+        message_uids: tuple[str, ...] | None = None,
+    ) -> list[ImapMessageHeader]:
+        """Fetch headers and readable parts, deferring attachment bytes until requested."""
+        if limit <= 0 or (before_uid is not None and before_uid <= 1):
+            return []
+        if message_uids is not None:
+            if after_uid or before_uid is not None:
+                raise ValueError("An explicit UID selection cannot be combined with a UID range.")
+            for requested_uid in message_uids:
+                _validate_uid(requested_uid)
+            if not message_uids:
+                return []
+        connection = self._login()
+        try:
+            if self._select(connection, folder_name, readonly=True)[0] != "OK":
+                raise ValueError("Could not open the IMAP folder.")
+            if message_uids is not None:
+                uids = sorted({int(uid) for uid in message_uids})[:limit]
+            else:
+                criteria = "ALL"
+                if before_uid is not None:
+                    criteria = f"UID 1:{before_uid - 1}"
+                elif after_uid:
+                    criteria = f"UID {after_uid + 1}:4294967295"
+                status, data = connection.uid("SEARCH", None, criteria)
+                if status != "OK":
+                    raise ValueError("Could not find messages.")
+                uids = sorted(
+                    uid
+                    for uid in _parse_uid_search_result(data)
+                    if uid > after_uid and (before_uid is None or uid < before_uid)
+                )
+                uids = uids[:limit] if after_uid else uids[-limit:]
+            messages = []
+            for index, uid in enumerate(reversed(uids), 1):
+                self._report_progress(
+                    f"{folder_name}: fetching message {index} of {len(uids)}..."
+                )
+                try:
+                    fields = fetch_fields(
+                        connection, str(uid), "(UID FLAGS BODYSTRUCTURE BODY.PEEK[HEADER])"
+                    )
+                except MessageMissingError:
+                    # A message can disappear between SEARCH and FETCH, or before a retry.
+                    continue
+                flags = tuple(
+                    flag.decode("ascii", errors="replace")
+                    for flag in fields.get(b"FLAGS", ())
+                )
+                header = _parse_message_header(
+                    str(uid), fields.get(b"BODY[HEADER]", b""), flags
+                )
+                try:
+                    parts = mime_parts(fields[b"BODYSTRUCTURE"])
+                    attachments = []
+                    texts: list[str] = []
+                    htmls: list[str] = []
+                    inline: dict[str, str] = {}
+                    remaining = 10 * 1024 * 1024
+                    for part in parts:
+                        if part.is_attachment:
+                            attachments.append(
+                                ImapAttachment(
+                                    filename=_decode_header_value(
+                                        part.headers.get_filename()
+                                    )
+                                    or "(unnamed)",
+                                    content_type=part.headers.get_content_type(),
+                                    size=part.encoded_size,
+                                    imap_section=part.section,
+                                    content_id=str(
+                                        part.headers.get("Content-ID", "")
+                                    ).strip("<>")
+                                    or None,
+                                    is_inline=part.headers.get_content_disposition()
+                                    == "inline",
+                                )
+                            )
+                            continue
+                        is_text = part.headers.get_content_type() in {
+                            "text/plain",
+                            "text/html",
+                        }
+                        is_image = (
+                            part.headers.get_content_maintype() == "image"
+                            and part.headers.get("Content-ID")
+                        )
+                        if not is_text and not is_image:
+                            continue
+                        if part.encoded_size > remaining:
+                            if is_text:
+                                raise ValueError("The message body is too large.")
+                            continue
+                        self._report_progress(
+                            f"{folder_name}: message {index}/{len(uids)}, "
+                            f"fetching part {part.section}..."
+                        )
+                        message, _content = fetch_part(connection, str(uid), part)
+                        remaining -= part.encoded_size
+                        _append_body_part(message, texts, htmls)
+                        _append_inline_resource(message, inline)
+                    body_html = _inline_cid_resources(
+                        "\n\n".join(htmls).strip(), inline
+                    )
+                    body_text = "\n\n".join(texts).strip() or _html_to_text(body_html)
+                    header = replace(
+                        header,
+                        body_html=body_html,
+                        body_text=body_text,
+                        body_preview=_build_body_preview(body_text),
+                        attachments=tuple(attachments),
+                    )
+                except (
+                    LookupError,
+                    UnicodeError,
+                    ValueError,
+                    TypeError,
+                    IndexError,
+                    ProtocolError,
+                ):
+                    header = replace(
+                        header,
+                        parse_error=True,
+                        body_text="The message body could not be fetched. Try syncing again.",
+                    )
+                messages.append(header)
+            return messages
+        finally:
+            with suppress(Exception):
+                self._release_connection(connection)
 
     def list_uids(self, folder_name: str) -> list[str] | None:
         """Return all message UIDs for one folder, or None on IMAP failure."""
         connection = self._login()
         try:
-            status, _data = connection.select(
-                _quote_mailbox(folder_name),
+            status, _data = self._select(
+                connection,
+                folder_name,
                 readonly=True,
             )
             if status != "OK":
@@ -196,7 +450,7 @@ class ImapClient:
 
             return [str(uid) for uid in _parse_uid_search_result(search_data)]
         finally:
-            connection.logout()
+            self._release_connection(connection)
 
     def fetch_recent_flags(
         self,
@@ -206,8 +460,9 @@ class ImapClient:
         """Fetch recent message flags without downloading message bodies."""
         connection = self._login()
         try:
-            status, data = connection.select(
-                _quote_mailbox(folder_name),
+            status, data = self._select(
+                connection,
+                folder_name,
                 readonly=True,
             )
             if status != "OK":
@@ -235,13 +490,13 @@ class ImapClient:
                 )
             return flags
         finally:
-            connection.logout()
+            self._release_connection(connection)
 
     def set_seen(self, folder_name: str, message_uid: str, is_read: bool) -> bool:
         """Mark one message as seen or unseen on the IMAP server."""
         connection = self._login()
         try:
-            status, _data = connection.select(_quote_mailbox(folder_name))
+            status, _data = self._select(connection, folder_name)
             if status != "OK":
                 return False
 
@@ -254,7 +509,7 @@ class ImapClient:
             )
             return status == "OK"
         finally:
-            connection.logout()
+            self._release_connection(connection)
 
     def append_message(
         self,
@@ -275,7 +530,7 @@ class ImapClient:
             )
             return status == "OK"
         finally:
-            connection.logout()
+            self._release_connection(connection)
 
     def move_message(
         self,
@@ -286,67 +541,36 @@ class ImapClient:
         """Move one message to another IMAP folder."""
         connection = self._login()
         try:
-            status, _data = connection.select(_quote_mailbox(folder_name))
+            status, _data = self._select(connection, folder_name)
             if status != "OK":
                 return False
 
+            _validate_uid(message_uid)
+            capabilities = {
+                c.decode() if isinstance(c, bytes) else c
+                for c in connection.capabilities
+            }
+            if "MOVE" not in capabilities:
+                raise ValueError(
+                    "The server does not support safe moves (UID MOVE). No message was moved."
+                )
             status, _data = connection.uid(
-                "MOVE",
-                message_uid,
-                _quote_mailbox(destination_folder_name),
+                "MOVE", message_uid, _quote_mailbox(destination_folder_name)
             )
-            if status == "OK":
-                return True
-
-            status, _data = connection.uid(
-                "COPY",
-                message_uid,
-                _quote_mailbox(destination_folder_name),
-            )
-            if status != "OK":
-                return False
-
-            status, _data = connection.uid(
-                "STORE",
-                message_uid,
-                "+FLAGS.SILENT",
-                r"(\Deleted)",
-            )
-            if status != "OK":
-                return False
-
-            status, _data = connection.expunge()
             return status == "OK"
         finally:
-            connection.logout()
+            with suppress(Exception):
+                self._release_connection(connection)
 
     def archive_message(self, folder_name: str, message_uid: str) -> bool:
-        """Archive one message by removing it from the selected folder."""
-        connection = self._login()
-        try:
-            status, _data = connection.select(_quote_mailbox(folder_name))
-            if status != "OK":
-                return False
-
-            status, _data = connection.uid(
-                "STORE",
-                message_uid,
-                "+FLAGS.SILENT",
-                r"(\Deleted)",
-            )
-            if status != "OK":
-                return False
-
-            status, _data = connection.expunge()
-            return status == "OK"
-        finally:
-            connection.logout()
+        """Legacy entry point; archive by moving, never by expunging."""
+        return self.move_message(folder_name, message_uid, "Archive")
 
     def archive_gmail_message(self, folder_name: str, message_uid: str) -> bool:
         """Archive a Gmail message by removing the Inbox label."""
         connection = self._login()
         try:
-            status, _data = connection.select(_quote_mailbox(folder_name))
+            status, _data = self._select(connection, folder_name)
             if status != "OK":
                 return False
 
@@ -356,97 +580,177 @@ class ImapClient:
                 "-X-GM-LABELS.SILENT",
                 r"(\Inbox)",
             )
-            if status == "OK":
-                return True
-
-            status, _data = connection.uid(
-                "STORE",
-                message_uid,
-                "-FLAGS.SILENT",
-                r"(\Inbox)",
-            )
             return status == "OK"
         finally:
-            connection.logout()
+            self._release_connection(connection)
+
+    def fetch_headers_before_uid(
+        self, folder_name: str, before_uid: int, limit: int = 25
+    ):
+        if before_uid <= 1 or limit <= 0:
+            return []
+        connection = self._login()
+        try:
+            if self._select(connection, folder_name, readonly=True)[0] != "OK":
+                raise ValueError("Could not open the IMAP folder.")
+            status, data = connection.uid("SEARCH", None, f"UID 1:{before_uid - 1}")
+            if status != "OK":
+                raise ValueError("Could not find older messages.")
+            uids = sorted(u for u in _parse_uid_search_result(data) if u < before_uid)[
+                -limit:
+            ]
+            if not uids:
+                return []
+            status, data = connection.uid(
+                "FETCH", ",".join(map(str, uids)), "(UID FLAGS BODY.PEEK[])"
+            )
+            if status != "OK":
+                raise ValueError("Could not fetch older messages.")
+            headers = []
+            for item in data:
+                raw, uid = _extract_header_bytes([item]), _extract_uid([item])
+                if raw is not None and uid is not None:
+                    headers.append(
+                        _parse_message_header(uid, raw, _extract_flags([item]))
+                    )
+            return list(reversed(headers))
+        finally:
+            self._release_connection(connection)
 
     def _login(self):
-        context = ssl.create_default_context()
+        if self._shared_connection is not None:
+            return self._shared_connection
+        self._report_progress("Connecting to the IMAP server...")
+        context = create_mail_ssl_context(
+            self._settings.host, self._settings.local_certificate
+        )
 
         if self._settings.security == "ssl":
             connection = self._connection_factory(
                 self._settings.host,
                 self._settings.port,
                 ssl_context=context,
+                timeout=self._settings.timeout,
             )
         elif self._settings.security == "starttls":
             connection = self._starttls_connection_factory(
                 self._settings.host,
                 self._settings.port,
+                timeout=self._settings.timeout,
             )
-            connection.starttls(ssl_context=context)
         else:
-            raise ValueError(f"Unsupported IMAP security mode: {self._settings.security}")
+            raise ValueError(
+                f"Unsupported IMAP security mode: {self._settings.security}"
+            )
 
-        if self._settings.auth_method == "oauth2":
-            connection.authenticate(
-                "XOAUTH2",
-                lambda _challenge: build_xoauth2_payload(
-                    self._settings.username,
-                    self._settings.password,
-                ).encode("utf-8"),
-            )
-        else:
-            connection.login(self._settings.username, self._settings.password)
+        auth_started = False
+        try:
+            if self._settings.security == "starttls":
+                connection.starttls(ssl_context=context)
+            self._report_progress("Signing in to the IMAP server...")
+            auth_started = True
+            if self._settings.auth_method == "oauth2":
+                payload = build_xoauth2_payload(
+                    self._settings.username, self._settings.password
+                ).encode("utf-8")
+                responses = 0
+
+                def respond(challenge: bytes) -> bytes | None:
+                    nonlocal responses
+                    self._report_progress("Signing in to the IMAP server...")
+                    responses += 1
+                    if responses == 1 and not challenge:
+                        return payload
+                    # XOAUTH2 error challenges require an empty acknowledgement.
+                    # Abort if the server keeps asking instead of completing auth.
+                    return b"" if responses <= 2 else None
+
+                connection.authenticate(
+                    "XOAUTH2",
+                    respond,
+                )
+            elif self._settings.password_mechanism == "plain":
+                if "AUTH=PLAIN" not in connection.capabilities:
+                    raise ValueError("IMAP server does not advertise AUTH=PLAIN.")
+                if (
+                    "\x00" in self._settings.username
+                    or "\x00" in self._settings.password
+                ):
+                    raise ValueError("NUL is not allowed in SASL PLAIN credentials.")
+                payload = (
+                    f"\x00{self._settings.username}\x00{self._settings.password}"
+                ).encode()
+                connection.authenticate("PLAIN", lambda _challenge: payload)
+            else:
+                connection.login(self._settings.username, self._settings.password)
+        except imaplib.IMAP4.error as error:
+            with suppress(Exception):
+                connection.shutdown()
+            if not auth_started or isinstance(error, imaplib.IMAP4.abort):
+                raise
+            raise ImapAuthenticationError(
+                "IMAP sign-in was rejected. Sign in to the account again."
+            ) from None
+        except Exception:
+            with suppress(Exception):
+                connection.shutdown()
+            raise
         return connection
 
 
-def _parse_folder(item: bytes | str) -> ImapFolder | None:
-    line = item.decode("utf-8", errors="replace") if isinstance(item, bytes) else item
-    line = line.strip()
-    if not line:
-        return None
-
-    flags = _parse_list_flags(line)
-    quoted_parts: list[str] = []
-    current = []
-    in_quotes = False
-    escaped = False
-
-    for character in line:
-        if escaped:
-            current.append(character)
-            escaped = False
-            continue
-
-        if character == "\\" and in_quotes:
-            escaped = True
-            continue
-
-        if character == '"':
-            if in_quotes:
-                quoted_parts.append("".join(current))
-                current = []
-            in_quotes = not in_quotes
-            continue
-
-        if in_quotes:
-            current.append(character)
-
-    if quoted_parts:
-        delimiter = quoted_parts[-2] if len(quoted_parts) >= 2 else None
-        return ImapFolder(name=quoted_parts[-1], flags=flags, delimiter=delimiter)
-
-    return ImapFolder(name=line.split()[-1], flags=flags)
+def _validate_uid(uid: str) -> None:
+    if not uid.isascii() or not uid.isdecimal() or int(uid) <= 0:
+        raise ValueError("Invalid IMAP UID.")
 
 
-def _parse_list_flags(line: str) -> tuple[str, ...]:
-    match = re.match(r"\((?P<flags>[^)]*)\)", line)
+def _selected_uidvalidity(connection) -> int:
+    _kind, data = connection.response("UIDVALIDITY")
+    if not data or data[0] is None or not data[0].isdigit() or int(data[0]) <= 0:
+        raise ValueError("The server did not provide a valid UIDVALIDITY. Sync cancelled.")
+    return int(data[0])
+
+
+def _parse_folder(item: bytes | str | tuple[bytes, bytes]) -> ImapFolder | None:
+    """Parse LIST fields in order; the mailbox need not be quoted."""
+    literal = None
+    if isinstance(item, tuple):
+        item, literal = item
+    line = item.decode("utf-8", errors="strict") if isinstance(item, bytes) else item
+    quoted = r'"(?:[^"\\\r\n\x00]|\\["\\])*"'
+    match = re.fullmatch(
+        rf"\((?P<flags>[^()\r\n]*)\) +(?P<delimiter>NIL|{quoted}) +"
+        rf'(?P<name>{quoted}|\{{[0-9]+\}}|[^\s(){{}}"\\\x00-\x1f\x7f]+)'
+        r"(?: +\(.*\))?",
+        line.strip(),
+    )
     if match is None:
-        return ()
-    return tuple(flag for flag in match.group("flags").split() if flag)
+        return None
+    name = match.group("name")
+    if name.startswith("{"):
+        if literal is None or len(literal) != int(name[1:-1]):
+            return None
+        name = literal.decode("utf-8", errors="strict")
+    elif literal is not None:
+        return None
+    else:
+        name = _unquote_imap_string(name)
+    delimiter = match.group("delimiter")
+    return ImapFolder(
+        name=name,
+        flags=tuple(match.group("flags").split()),
+        delimiter=None if delimiter == "NIL" else _unquote_imap_string(delimiter),
+    )
+
+
+def _unquote_imap_string(value: str) -> str:
+    if not value.startswith('"'):
+        return value
+    return re.sub(r'\\(["\\])', r"\1", value[1:-1])
 
 
 def _quote_mailbox(folder_name: str) -> str:
+    if any(ord(character) < 32 or ord(character) == 127 for character in folder_name):
+        raise ValueError("Control characters are not supported in IMAP mailbox names.")
     escaped = folder_name.replace("\\", "\\\\").replace('"', '\\"')
     return f'"{escaped}"'
 
@@ -474,9 +778,7 @@ def _parse_uid_search_result(data) -> list[int]:
         if item is None:
             continue
         raw_item = (
-            item.decode("ascii", errors="replace")
-            if isinstance(item, bytes)
-            else item
+            item.decode("ascii", errors="replace") if isinstance(item, bytes) else item
         )
         for raw_uid in str(raw_item).split():
             try:
@@ -526,8 +828,7 @@ def _extract_flags(fetch_data) -> tuple[str, ...]:
             continue
 
         return tuple(
-            flag.decode("ascii", errors="replace")
-            for flag in match.group(1).split()
+            flag.decode("ascii", errors="replace") for flag in match.group(1).split()
         )
 
     return ()
@@ -537,6 +838,22 @@ def _parse_message_header(
     message_uid: str,
     message_bytes: bytes,
     flags: tuple[str, ...],
+) -> ImapMessageHeader:
+    try:
+        return _parse_message_header_content(message_uid, message_bytes, flags)
+    except (LookupError, UnicodeError, ValueError, TypeError, IndexError):
+        # Keep the UID visible and let later messages sync even if MIME is broken.
+        return ImapMessageHeader(
+            uid=message_uid,
+            flags=flags,
+            subject="Message could not be parsed",
+            body_text="This message has invalid content. Open it in webmail.",
+            parse_error=True,
+        )
+
+
+def _parse_message_header_content(
+    message_uid: str, message_bytes: bytes, flags: tuple[str, ...]
 ) -> ImapMessageHeader:
     message = message_from_bytes(message_bytes, policy=default)
     raw_message_id = message.get("Message-ID")
@@ -549,7 +866,14 @@ def _parse_message_header(
         message_id=raw_message_id.strip() if raw_message_id else None,
         subject=_decode_header_value(message.get("Subject")),
         sender=_decode_header_value(message.get("From")),
-        recipients=_decode_header_value(message.get("To")),
+        recipients=", ".join(
+            _decode_header_value(value)
+            for name in ("To", "Cc")
+            for value in message.get_all(name, [])
+        ),
+        reply_to=_decode_header_value(message.get("Reply-To")),
+        in_reply_to=str(message.get("In-Reply-To", "")),
+        references=str(message.get("References", "")),
         date=date,
         body_text=body_text,
         body_html=body_html,
@@ -573,7 +897,9 @@ def _normalize_date(value: str | None) -> str | None:
         return value
 
 
-def _extract_message_parts(message: Message) -> tuple[str, str, tuple[ImapAttachment, ...]]:
+def _extract_message_parts(
+    message: Message,
+) -> tuple[str, str, tuple[ImapAttachment, ...]]:
     text_parts: list[str] = []
     html_parts: list[str] = []
     inline_resources: dict[str, str] = {}
@@ -599,7 +925,9 @@ def _extract_message_parts(message: Message) -> tuple[str, str, tuple[ImapAttach
     return body_text, body_html, tuple(attachments)
 
 
-def _append_attachment(part: Message, attachments: list[ImapAttachment]) -> None:
+def _append_attachment(
+    part: Message, attachments: list[ImapAttachment], *, cache_all: bool = False
+) -> None:
     disposition = (part.get_content_disposition() or "").casefold()
     filename = part.get_filename()
     content_id = part.get("Content-ID")
@@ -615,12 +943,13 @@ def _append_attachment(part: Message, attachments: list[ImapAttachment]) -> None
     size = len(payload) if isinstance(payload, bytes) else 0
     cached_content = (
         payload
-        if isinstance(payload, bytes) and size <= MAX_AUTO_CACHED_ATTACHMENT_BYTES
+        if isinstance(payload, bytes)
+        and (cache_all or size <= MAX_AUTO_CACHED_ATTACHMENT_BYTES)
         else None
     )
     attachments.append(
         ImapAttachment(
-            filename=_decode_header_value(filename) if filename else "(uten navn)",
+            filename=_decode_header_value(filename) if filename else "(unnamed)",
             content_type=part.get_content_type(),
             size=size,
             content_id=clean_content_id,
@@ -683,7 +1012,10 @@ def _append_body_part(
         if not isinstance(payload, bytes):
             return
         charset = part.get_content_charset() or "utf-8"
-        content = payload.decode(charset, errors="replace")
+        try:
+            content = payload.decode(charset, errors="replace")
+        except LookupError:
+            content = payload.decode("utf-8", errors="replace")
 
     if not isinstance(content, str):
         return

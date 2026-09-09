@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=mcpMail
+Comment=Desktop email client
+Exec=mcpMail
+TryExec=mcpMail
+Icon=mail-message-new
+Terminal=false
+Categories=Network;Email;
+StartupNotify=true

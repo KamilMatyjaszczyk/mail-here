@@ -187,7 +187,7 @@ def test_mail_store_replaces_and_lists_message_attachments(
 ) -> None:
     account = store.add_account("Privat", "privat@example.com")
     inbox = store.add_folder(account.id, "Inbox")
-    message = store.add_message(account.id, inbox.id, subject="Vedlegg")
+    message = store.add_message(account.id, inbox.id, subject="Attachments")
 
     store.replace_message_attachments(
         message.id,

@@ -14,14 +14,13 @@ from mailklient.database import (
     delete_message,
     delete_messages_missing_from_folder,
     get_account,
-    get_folder,
-    get_folder_by_name,
-    get_folder_last_seen_uid,
     get_attachment_content,
+    get_folder,
+    get_folder_last_seen_uid,
     get_message,
-    list_attachments_for_message,
     initialize_database,
     list_accounts,
+    list_attachments_for_message,
     list_folders,
     list_messages_for_folder,
     list_unified_inbox_messages,
@@ -29,6 +28,7 @@ from mailklient.database import (
     move_message_to_folder,
     replace_message_attachments,
     set_attachment_content,
+    update_account,
     update_folder_last_seen_uid,
     update_folder_remote_id,
     update_message_flags,
@@ -36,6 +36,7 @@ from mailklient.database import (
 )
 from mailklient.database.connection import DatabasePath
 from mailklient.domain import Account, Attachment, Folder, Message
+from mailklient.domain.folders import standard_folder_name
 
 DEFAULT_FOLDERS = ("Innboks", "Sendt", "Søppelpost", "Papirkurv")
 
@@ -46,6 +47,7 @@ class MailStore:
     def __init__(self, database_path: DatabasePath) -> None:
         self.database_path = Path(database_path)
         initialize_database(self.database_path)
+        self.remove_empty_folder_placeholders()
 
     def add_account_with_default_folders(
         self,
@@ -61,6 +63,8 @@ class MailStore:
         smtp_port: int | None = None,
         smtp_security: str = "starttls",
         oauth_provider: str | None = None,
+        provider: str = "imap",
+        local_certificate: str | None = None,
     ) -> Account:
         """Add an account and create the standard local folders."""
         account = self.add_account(
@@ -75,6 +79,8 @@ class MailStore:
             smtp_port=smtp_port,
             smtp_security=smtp_security,
             oauth_provider=oauth_provider,
+            provider=provider,
+            local_certificate=local_certificate,
         )
 
         for folder_name in DEFAULT_FOLDERS:
@@ -96,6 +102,8 @@ class MailStore:
         smtp_port: int | None = None,
         smtp_security: str = "starttls",
         oauth_provider: str | None = None,
+        provider: str = "imap",
+        local_certificate: str | None = None,
     ) -> Account:
         """Add an account to the local cache."""
         with connect(self.database_path) as connection:
@@ -112,6 +120,8 @@ class MailStore:
                 smtp_port=smtp_port,
                 smtp_security=smtp_security,
                 oauth_provider=oauth_provider,
+                provider=provider,
+                local_certificate=local_certificate,
             )
 
     def list_accounts(self) -> list[Account]:
@@ -128,6 +138,11 @@ class MailStore:
         """Delete an account and its local cached data."""
         with connect(self.database_path) as connection:
             return delete_account(connection, account_id)
+
+    def update_account(self, account: Account) -> Account:
+        """Persist edited account metadata without replacing cached mail."""
+        with connect(self.database_path) as connection:
+            return update_account(connection, account)
 
     def add_folder(
         self,
@@ -147,21 +162,66 @@ class MailStore:
     ) -> Folder:
         """Return a folder, creating it if needed."""
         with connect(self.database_path) as connection:
-            folder = get_folder_by_name(connection, account_id, name)
-            if folder is not None:
-                if remote_id and folder.remote_id != remote_id:
-                    return update_folder_remote_id(connection, folder.id, remote_id)
-                return folder
-            for folder in list_folders(connection, account_id):
-                if _folder_names_match(folder.name, name, remote_id):
-                    if remote_id and folder.remote_id != remote_id:
-                        return update_folder_remote_id(
-                            connection,
-                            folder.id,
-                            remote_id,
-                        )
+            folders = list_folders(connection, account_id)
+            # A remote mailbox owns its UID namespace, even when names are aliases.
+            for folder in folders:
+                if remote_id and remote_id != "/" and folder.remote_id == remote_id:
                     return folder
-            return create_folder(connection, account_id, name, remote_id)
+            matches = [
+                folder
+                for folder in folders
+                if _folder_names_match(folder.name, name, remote_id)
+            ]
+            matches.sort(
+                key=lambda folder: (folder.remote_id is None, folder.name != name)
+            )
+            for folder in matches:
+                if remote_id is None:
+                    return folder
+                if folder.remote_id in {None, "/"}:
+                    return update_folder_remote_id(connection, folder.id, remote_id)
+            occupied_names = {folder.name for folder in folders}
+            local_name = name
+            if local_name in occupied_names:
+                local_name = remote_id or name
+                suffix = 2
+                while local_name in occupied_names:
+                    local_name = f"{remote_id or name} ({suffix})"
+                    suffix += 1
+            return create_folder(connection, account_id, local_name, remote_id)
+
+    def remove_empty_folder_placeholders(self, account_id: int | None = None) -> int:
+        """Remove only empty, unbound local duplicates of known server folders."""
+        removed = 0
+        with connect(self.database_path) as connection:
+            accounts = (
+                list_accounts(connection)
+                if account_id is None
+                else [get_account(connection, account_id)]
+            )
+            for account in accounts:
+                if account is None:
+                    continue
+                folders = list_folders(connection, account.id)
+                remote_roles = {
+                    standard_folder_name(folder.name)
+                    or standard_folder_name(folder.remote_id)
+                    for folder in folders
+                    if folder.remote_id and folder.remote_id != "/"
+                } - {None}
+                for folder in folders:
+                    if (
+                        folder.remote_id is not None
+                        or standard_folder_name(folder.name) not in remote_roles
+                    ):
+                        continue
+                    cursor = connection.execute(
+                        "DELETE FROM folders WHERE id = ? AND remote_id IS NULL "
+                        "AND NOT EXISTS (SELECT 1 FROM messages WHERE folder_id = ?)",
+                        (folder.id, folder.id),
+                    )
+                    removed += cursor.rowcount
+        return removed
 
     def list_folders(self, account_id: int) -> list[Folder]:
         """List folders for one account."""
@@ -184,12 +244,15 @@ class MailStore:
         subject: str = "",
         sender: str = "",
         recipients: str = "",
+        reply_to: str = "",
         sent_at: str | None = None,
         received_at: str | None = None,
         is_read: bool = False,
         body_preview: str = "",
         body_text: str = "",
         body_html: str = "",
+        in_reply_to: str = "",
+        references: str = "",
     ) -> Message:
         """Add message metadata to the local cache."""
         with connect(self.database_path) as connection:
@@ -203,12 +266,15 @@ class MailStore:
                 subject=subject,
                 sender=sender,
                 recipients=recipients,
+                reply_to=reply_to,
                 sent_at=sent_at,
                 received_at=received_at,
                 is_read=is_read,
                 body_preview=body_preview,
                 body_text=body_text,
                 body_html=body_html,
+                in_reply_to=in_reply_to,
+                references=references,
             )
 
     def save_message_metadata(
@@ -222,12 +288,16 @@ class MailStore:
         subject: str = "",
         sender: str = "",
         recipients: str = "",
+        reply_to: str = "",
         sent_at: str | None = None,
         received_at: str | None = None,
         is_read: bool = False,
         body_preview: str = "",
         body_text: str = "",
         body_html: str = "",
+        in_reply_to: str = "",
+        references: str = "",
+        body_fetch_failed: bool = False,
     ) -> Message:
         """Create or update message metadata in the local cache."""
         with connect(self.database_path) as connection:
@@ -241,18 +311,64 @@ class MailStore:
                 subject=subject,
                 sender=sender,
                 recipients=recipients,
+                reply_to=reply_to,
                 sent_at=sent_at,
                 received_at=received_at,
                 is_read=is_read,
                 body_preview=body_preview,
                 body_text=body_text,
                 body_html=body_html,
+                in_reply_to=in_reply_to,
+                references=references,
+                body_fetch_failed=body_fetch_failed,
             )
+
+    def failed_message_uids(
+        self, account_id: int, folder_id: int, limit: int = 25
+    ) -> tuple[str, ...]:
+        """Return a bounded set of failed body fetches for the next sync."""
+        if limit <= 0:
+            return ()
+        with connect(self.database_path) as connection:
+            rows = connection.execute(
+                "SELECT imap_uid FROM messages "
+                "WHERE account_id = ? AND folder_id = ? AND body_fetch_failed = 1 "
+                "AND imap_uid != '' AND imap_uid NOT GLOB '*[^0-9]*' "
+                "AND CAST(imap_uid AS INTEGER) > 0 ORDER BY id DESC LIMIT ?",
+                (account_id, folder_id, limit),
+            ).fetchall()
+        return tuple(row["imap_uid"] for row in rows)
 
     def list_messages(self, account_id: int, folder_id: int) -> list[Message]:
         """List message metadata for one folder."""
         with connect(self.database_path) as connection:
             return list_messages_for_folder(connection, account_id, folder_id)
+
+    def list_mailbox_messages(
+        self, account_id: int | None, folder_name: str
+    ) -> list[Message]:
+        """Group standard folders for display, retaining each message's source."""
+        if folder_name not in {"Innboks", "Papirkurv", "Søppelpost"}:
+            raise ValueError("Unknown mailbox view.")
+        with connect(self.database_path) as connection:
+            account_ids = (
+                [account.id for account in list_accounts(connection)]
+                if account_id is None
+                else [account_id]
+            )
+            messages = []
+            for selected_id in account_ids:
+                for folder in list_folders(connection, selected_id):
+                    role = (
+                        standard_folder_name(folder.remote_id)
+                        if folder.remote_id
+                        else None
+                    ) or standard_folder_name(folder.name)
+                    if role == folder_name:
+                        messages.extend(
+                            list_messages_for_folder(connection, selected_id, folder.id)
+                        )
+            return messages
 
     def get_message(self, message_id: int) -> Message | None:
         """Return one cached message."""
@@ -292,6 +408,45 @@ class MailStore:
         """Return how many messages are cached in one folder."""
         with connect(self.database_path) as connection:
             return count_messages_for_folder(connection, account_id, folder_id)
+
+    def folder_uidvalidity(self, account_id: int, folder_id: int) -> int | None:
+        with connect(self.database_path) as connection:
+            row = connection.execute(
+                "SELECT uidvalidity FROM folder_sync_state WHERE account_id = ? AND folder_id = ?",
+                (account_id, folder_id),
+            ).fetchone()
+            return row["uidvalidity"] if row else None
+
+    def reconcile_uidvalidity(
+        self, account_id: int, folder_id: int, validity: int
+    ) -> None:
+        with connect(self.database_path) as connection:
+            row = connection.execute(
+                "SELECT uidvalidity FROM folder_sync_state WHERE account_id = ? AND folder_id = ?",
+                (account_id, folder_id),
+            ).fetchone()
+            if row is not None and row["uidvalidity"] == validity:
+                return
+            # Only stale remote cache is removed; local sent copies are retained.
+            connection.execute(
+                "DELETE FROM messages WHERE account_id = ? AND folder_id = ? AND imap_uid IS NOT NULL",
+                (account_id, folder_id),
+            )
+            connection.execute(
+                "INSERT INTO folder_sync_state(account_id, folder_id, last_seen_uid, uidvalidity) "
+                "VALUES (?, ?, 0, ?) ON CONFLICT(account_id, folder_id) DO UPDATE SET "
+                "last_seen_uid = 0, uidvalidity = excluded.uidvalidity",
+                (account_id, folder_id, validity),
+            )
+
+    def oldest_folder_uid(self, account_id: int, folder_id: int) -> int | None:
+        with connect(self.database_path) as connection:
+            row = connection.execute(
+                "SELECT MIN(CAST(imap_uid AS INTEGER)) FROM messages "
+                "WHERE account_id = ? AND folder_id = ? AND CAST(imap_uid AS INTEGER) > 0",
+                (account_id, folder_id),
+            ).fetchone()
+            return row[0]
 
     def get_folder_last_seen_uid(self, account_id: int, folder_id: int) -> int:
         """Return the highest IMAP UID synced for a folder."""
@@ -376,22 +531,10 @@ def _folder_names_match(
     requested_name: str,
     requested_remote_id: str | None,
 ) -> bool:
-    existing_aliases = _folder_aliases(existing_name)
-    requested_aliases = _folder_aliases(requested_name)
-    if requested_remote_id:
-        requested_aliases.update(_folder_aliases(requested_remote_id))
-    return bool(existing_aliases & requested_aliases)
-
-
-def _folder_aliases(name: str) -> set[str]:
-    normalized = name.rsplit("/", maxsplit=1)[-1].casefold()
-    aliases = {name.casefold(), normalized}
-    if normalized in {"inbox", "innboks"}:
-        aliases.update({"inbox", "innboks"})
-    elif normalized in {"sent", "sent mail", "sendt"}:
-        aliases.update({"sent", "sent mail", "sendt"})
-    elif normalized in {"trash", "papirkurv", "deleted items"}:
-        aliases.update({"trash", "papirkurv", "deleted items"})
-    elif normalized in {"all mail", "all e-post", "alle e-poster"}:
-        aliases.update({"all mail", "all e-post", "alle e-poster"})
-    return aliases
+    if existing_name == requested_name:
+        return True
+    existing_role = standard_folder_name(existing_name)
+    requested_role = standard_folder_name(requested_name)
+    if requested_role is None and requested_remote_id:
+        requested_role = standard_folder_name(requested_remote_id)
+    return existing_role is not None and existing_role == requested_role

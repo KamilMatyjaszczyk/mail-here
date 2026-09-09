@@ -1,0 +1,10 @@
+FROM registry.fedoraproject.org/fedora:44
+
+RUN dnf -y --setopt=install_weak_deps=False install \
+        rpm-build python3-devel pyproject-rpm-macros \
+        python3-setuptools python3-wheel python3-pip python3-build \
+        python3-pytest python3-imapclient python3-keyring python3-pyside6 \
+        desktop-file-utils openssl findutils tar gzip \
+    && dnf clean all
+
+WORKDIR /build

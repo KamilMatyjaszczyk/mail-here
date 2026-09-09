@@ -1,21 +1,26 @@
 from __future__ import annotations
 
+import pytest
+
 from mailklient.mail import (
     ImapClient,
     ImapFolder,
     ImapMessageFlags,
     ImapMessageHeader,
     SmtpClient,
+    imap_client,
 )
-import mailklient.mail.imap_client as imap_client
 from mailklient.mail.config import ImapSettings, SmtpSettings
 
 
 class FakeImapConnection:
-    def __init__(self, host, port, ssl_context=None) -> None:
+    def __init__(self, host, port, ssl_context=None, timeout=None) -> None:
         self.host = host
         self.port = port
         self.ssl_context = ssl_context
+        self.timeout = timeout
+        self.capabilities = ("IMAP4rev1", "MOVE", "UIDPLUS")
+        self.shutdown_called = False
         self.starttls_context = None
         self.logged_in_as: tuple[str, str] | None = None
         self.authenticated_with: tuple[str, bytes] | None = None
@@ -37,6 +42,10 @@ class FakeImapConnection:
 
     def logout(self) -> None:
         self.logged_out = True
+        self.shutdown()
+
+    def shutdown(self) -> None:
+        self.shutdown_called = True
 
     def list(self):
         return "OK", [
@@ -107,10 +116,12 @@ class FakeImapConnection:
 
 
 class FakeSmtpConnection:
-    def __init__(self, host, port, context=None) -> None:
+    def __init__(self, host, port, context=None, timeout=None) -> None:
         self.host = host
         self.port = port
         self.context = context
+        self.timeout = timeout
+        self.close_called = False
         self.starttls_context = None
         self.logged_in_as: tuple[str, str] | None = None
         self.authenticated_with: tuple[str, str] | None = None
@@ -119,6 +130,9 @@ class FakeSmtpConnection:
 
     def starttls(self, context=None) -> None:
         self.starttls_context = context
+
+    def ehlo(self):
+        return 250, b"OK"
 
     def login(self, username: str, password: str) -> None:
         self.logged_in_as = (username, password)
@@ -134,6 +148,9 @@ class FakeSmtpConnection:
 
     def quit(self) -> None:
         self.quit_called = True
+
+    def close(self) -> None:
+        self.close_called = True
 
     def send_message(self, message, to_addrs=None) -> None:
         self.sent_messages.append((message, to_addrs))
@@ -232,6 +249,60 @@ def test_imap_client_lists_folders() -> None:
         ImapFolder(name="INBOX", flags=("\\HasNoChildren",), delimiter="/"),
         ImapFolder(name="Sent Items", flags=("\\HasNoChildren",), delimiter="/"),
     ]
+
+
+@pytest.mark.parametrize("response, expected", [
+    (b'(\\Marked \\HasNoChildren) "/" Inbox',
+     ImapFolder("Inbox", ("\\Marked", "\\HasNoChildren"), "/")),
+    (b'(\\HasNoChildren \\Sent) "/" Sent',
+     ImapFolder("Sent", ("\\HasNoChildren", "\\Sent"), "/")),
+    (b'(\\HasChildren \\Trash) "/" Deleted',
+     ImapFolder("Deleted", ("\\HasChildren", "\\Trash"), "/")),
+    (b'(\\Junk) "/" Junk', ImapFolder("Junk", ("\\Junk",), "/")),
+    (b'() NIL INBOX', ImapFolder("INBOX")),
+    (b'() NIL "Sent Items"', ImapFolder("Sent Items")),
+    (b'(\\Sent) "/" "[Gmail]/Sent Mail"',
+     ImapFolder("[Gmail]/Sent Mail", ("\\Sent",), "/")),
+    (b'() "/" "Sent Items" ("OLDNAME" ("Previous name"))',
+     ImapFolder("Sent Items", (), "/")),
+    (b'() "/" "Quotes \\" and slash \\\\"',
+     ImapFolder('Quotes " and slash \\', (), "/")),
+    ((b'() "/" {10}', b'Sent Items'), ImapFolder("Sent Items", (), "/")),
+    (b'() "/" "S&APg-ppelpost"', ImapFolder("S&APg-ppelpost", (), "/")),
+    (b'() "/"', None),
+    (b'() "/" "unclosed', None),
+    (b'() "/" {10}', None),
+    ((b'() "/" {11}', b'Sent Items'), None),
+    (b'', None),
+])
+def test_imap_list_parses_mailbox_field_not_delimiter(response, expected):
+    assert imap_client._parse_folder(response) == expected
+
+
+def test_outlook_list_to_examine_preserves_mailbox_name():
+    class OutlookConnection(FakeImapConnection):
+        def list(self):
+            return "OK", [b'(\\Marked \\HasNoChildren) "/" Inbox']
+
+        def select(self, mailbox, readonly=False):
+            assert mailbox == '"Inbox"'
+            assert readonly is True
+            return super().select(mailbox, readonly)
+
+    client = ImapClient(
+        ImapSettings("outlook.office365.com", 993, "user@example.com", "token"),
+        connection_factory=OutlookConnection,
+    )
+    folder = client.list_folders()[0]
+    headers = client.fetch_headers(folder.name, limit=2)
+    assert len(headers) == 2
+    assert headers[0].body_text
+
+
+@pytest.mark.parametrize("name", ["Inbox\r\nLOGOUT", "Inbox\x00", "Inbox\t", "Inbox\x7f"])
+def test_mailbox_quoting_rejects_control_characters(name):
+    with pytest.raises(ValueError, match="Control characters"):
+        imap_client._quote_mailbox(name)
 
 
 def test_imap_client_fetches_recent_headers_newest_first() -> None:
@@ -429,10 +500,10 @@ def test_imap_client_archives_message() -> None:
 
     assert client.archive_message("INBOX", "102")
     assert connections[0].uid_requests[-1] == (
-        "STORE",
-        ("102", "+FLAGS.SILENT", r"(\Deleted)"),
+        "MOVE",
+        ("102", '"Archive"'),
     )
-    assert connections[0].expunged
+    assert not connections[0].expunged
 
 
 def test_imap_client_archives_gmail_by_removing_inbox_label() -> None:
@@ -838,7 +909,7 @@ def test_smtp_client_sends_plain_text_message() -> None:
     assert sent_message["Subject"] == "Hei"
     assert sent_message["Date"]
     assert sent_message["Message-ID"]
-    assert sent_message["User-Agent"] == "Mailklient/0.1"
+    assert sent_message["User-Agent"] == "mcpMail/0.1"
     assert sent_message.get_content().strip() == "Dette er en test."
     assert to_addrs == ["friend@example.com"]
     assert connections[0].quit_called

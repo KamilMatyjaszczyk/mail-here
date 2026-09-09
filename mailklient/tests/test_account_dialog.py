@@ -43,7 +43,7 @@ def test_account_dialog_returns_trimmed_data() -> None:
         smtp_host="smtp.example.com",
         smtp_port=587,
         smtp_security="starttls",
-        password="hemmelig",
+        password="  hemmelig  ",
     )
 
     dialog.close()

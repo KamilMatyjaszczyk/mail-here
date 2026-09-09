@@ -393,7 +393,7 @@ def test_mark_message_read_updates_read_state(connection) -> None:
 def test_replace_and_list_message_attachments(connection) -> None:
     account = create_account(connection, "Privat", "privat@example.com")
     inbox = create_folder(connection, account.id, "Inbox")
-    message = create_message(connection, account.id, inbox.id, subject="Vedlegg")
+    message = create_message(connection, account.id, inbox.id, subject="Attachments")
 
     replace_message_attachments(
         connection,
@@ -445,7 +445,7 @@ def test_replace_and_list_message_attachments(connection) -> None:
 def test_get_and_set_attachment_content(connection) -> None:
     account = create_account(connection, "Privat", "privat@example.com")
     inbox = create_folder(connection, account.id, "Inbox")
-    message = create_message(connection, account.id, inbox.id, subject="Vedlegg")
+    message = create_message(connection, account.id, inbox.id, subject="Attachments")
 
     replace_message_attachments(
         connection,
