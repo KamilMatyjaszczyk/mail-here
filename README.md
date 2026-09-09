@@ -10,7 +10,7 @@ accounts are the main focus.
 **Before you begin:** You must register your own OAuth app for Gmail or Outlook
 and provide your own client ID, whether you install from source or use the RPM.
 The maintainer's client ID and client secret are not bundled with mcpMail.
-See the [OAuth guide](docs/oauth.md).
+See the [OAuth guide](mailklient/docs/oauth.md).
 
 ## Features
 
@@ -51,7 +51,7 @@ mcpMail
 ```
 
 This installs the app, dependencies and an application menu entry without a venv.
-The [RPM guide](docs/rpm.md) also explains how to build the package directly from
+The [RPM guide](mailklient/docs/rpm.md) also explains how to build the package directly from
 a GitHub clone. You still need a keyring and your own OAuth setup.
 The remaining installation commands below apply to installation from source.
 
@@ -85,7 +85,7 @@ leave the client secret empty for the public desktop app. A client ID identifies
 your app registration; it is not your email password. Save these values through
 the app's settings dialog, not in the source code or Git.
 
-1. Follow the [Gmail or Outlook setup](docs/oauth.md) to register your own OAuth app.
+1. Follow the [Gmail or Outlook setup](mailklient/docs/oauth.md) to register your own OAuth app.
 2. Open **Account > OAuth app settings** and save the provider's values in the keyring.
 3. Select **Account > Add account**, enter the account details and use OAuth2 for Gmail/Outlook.
 4. Complete sign-in in the browser. Use **Account > Sign in with OAuth** when needed.
@@ -154,11 +154,11 @@ cleanup; files you have saved yourself are not affected.
 
 Prefer the OAuth settings dialog. Environment variables take precedence over the
 keyring, and the app **does not read `.env` automatically**. See the
-[OAuth guide](docs/oauth.md) for details and troubleshooting.
+[OAuth guide](mailklient/docs/oauth.md) for details and troubleshooting.
 
 ## Updating and uninstalling
 
-For RPM installations, use DNF as described in the [RPM guide](docs/rpm.md).
+For RPM installations, use DNF as described in the [RPM guide](mailklient/docs/rpm.md).
 For source installations:
 
 When first upgrading from the old package name **Mailklient**, remove the old
@@ -226,7 +226,7 @@ combinable search filters, message details, local threads and attachment metadat
 
 This prepares for a future AI/MCP adapter. **There is no MCP server or active
 AI integration yet.** The read layer performs no sync or write operations.
-See the [MCP architecture](docs/MCP_ARCHITECTURE.md) for the API, security boundaries
+See the [MCP architecture](mailklient/docs/MCP_ARCHITECTURE.md) for the API, security boundaries
 and remaining work before an adapter can be exposed.
 
 ## Known limitations
@@ -242,7 +242,7 @@ and remaining work before an adapter can be exposed.
 
 ## Troubleshooting
 
-For sign-in problems, start with the [OAuth guide](docs/oauth.md), check the keyring
+For sign-in problems, start with the [OAuth guide](mailklient/docs/oauth.md), check the keyring
 and try **Test IMAP** / **Test SMTP** separately.
 
 For freezes or crashes, start the app from a terminal:
