@@ -79,11 +79,12 @@ def test_production_startup_does_not_insert_demo_data(
             setDesktopFileName=lambda value: identity.update(desktop=value),
         ),
     )
-    monkeypatch.setattr(
-        entry,
-        "MainWindow",
-        lambda _: SimpleNamespace(show=lambda: None, initialize_bridge=lambda: None),
-    )
+    def window(mail_store, *, mail_service):
+        assert isinstance(mail_service, entry.MailService)
+        assert mail_store.database_path == store.database_path
+        return SimpleNamespace(show=lambda: None, initialize_bridge=lambda: None)
+
+    monkeypatch.setattr(entry, "MainWindow", window)
     monkeypatch.setattr(entry, "QTimer", SimpleNamespace(singleShot=lambda *args: None))
 
     def locate(location, filename):

@@ -10,7 +10,7 @@ from PySide6.QtCore import QStandardPaths, QTimer
 from PySide6.QtWidgets import QApplication
 
 from mailklient.config import default_database_path
-from mailklient.services import MailStore, seed_demo_data
+from mailklient.services import MailService, MailStore, seed_demo_data
 from mailklient.ui.main_window import MainWindow
 
 
@@ -37,7 +37,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.demo:
         seed_demo_data(store)
 
-    window = MainWindow(store)
+    window = MainWindow(store, mail_service=MailService(store.database_path))
     window.show()
     QTimer.singleShot(0, window.initialize_bridge)
 

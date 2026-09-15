@@ -1,14 +1,17 @@
-# Preparing a read-only MCP adapter
+# Read-only mail service and local MCP adapter
 
-No MCP server, AI model, listener, API authentication or new dependency is added
-in this step. These are local Python contracts that a thin adapter can call.
+The local Python read contracts are now used by an optional stdio MCP adapter.
+See [the local MCP guide](mcp.md) for installation, client configuration and tests.
+No HTTP listener, remote authentication or write tools are implemented.
 
 ## Architecture
 
 ```text
-Desktop UI                         Future MCP/API adapter
+Desktop UI                         Local stdio MCP adapter
     |                                      |
-    +---------- MailReadService ------------+
+    +------------- MailService -------------+
+                       |
+             MailRepository (Protocol)
                        |
                MailReadRepository
                        |
@@ -26,18 +29,30 @@ security/ --> keyring, OAuth, TLS, safe attachment files
 - `domain/models.py` remains the source for `Message` and `Attachment`.
   `domain/mail_queries.py` adds only filters and result envelopes, not duplicate
   mail models. `domain/errors.py` defines the public read errors.
-- `services/mail_read.py` validates requests, orchestrates reads, translates
-  storage errors, and emits content-free operation logs.
-- `database/mail_reader.py` owns parameterized SQL, pagination and transactions.
+- `services/mail_service.py` validates requests, orchestrates reads and page
+  traversal, and emits content-free operation logs.
+- `domain/mail_repository.py` defines the injectable `MailRepository` protocol.
+  Implementations accept normalized filters, return the shared result models,
+  and report storage failures as domain errors.
+- `database/mail_reader.py` owns parameterized SQL, pagination, transactions
+  and translation of SQLite failures to `MailStoreUnavailable`.
   Each operation opens/closes its own `mode=ro` connection with `query_only`.
 - `MailStore` and `database/repositories.py` retain existing cache writes.
   `MailStore` construction initializes/migrates the database and can clean up
   empty placeholders. **A read adapter must not construct MailStore.**
-- The desktop search and message reader now call `MailReadService`. The desktop
-  consumes all pages to preserve its existing full-list behavior. Large-list
+- The desktop search and message reader call `MailService`. `main.py` injects
+  the service into `MainWindow`; tests can supply an alternative instance.
+  The service's `iter_emails()` consumes search pages lazily. The desktop
+  renders all results to preserve its existing full-list behavior. Large-list
   UI virtualization and asynchronous local search are separate future work.
 - `mail/` remains the provider/protocol layer; `workers/` handles GUI background
   jobs. None of the read operations requires Qt, a worker, keyring or a prompt.
+
+`MailService(database_path)` uses the existing SQLite repository.
+`MailService(repository=custom_repository)` uses an injected implementation;
+provide exactly one source. No database is opened when injecting a repository.
+The old import `from mailklient.services.mail_read import MailReadService` remains
+an alias for compatibility.
 
 ## Available operations
 
@@ -50,6 +65,11 @@ security/ --> keyring, OAuth, TLS, safe attachment files
 | `get_email(email_id)` | `EmailDetails(message, thread_id, attachments)` |
 | `get_thread(thread_id, *, limit=50, offset=0)` | Cached thread members, oldest first |
 | `get_attachments(email_id)` | Tuple of `Attachment` metadata; no content download |
+
+`iter_emails(query="", filters=None, *, page_size=200, sort_order="date_desc")`
+is a local convenience iterator used by the desktop. It validates on iteration,
+fetches pages on demand and propagates failures. An adapter should expose the
+bounded operations above, rather than collecting an unlimited iterator.
 
 An `EmailPage` contains `items`, `limit`, `offset`, and `next_offset` (`None` at
 the end). `EmailPage.to_dict()` and `EmailDetails.to_dict()` are JSON-serializable;
@@ -66,9 +86,9 @@ import json
 
 from mailklient.config import default_database_path
 from mailklient.domain.mail_queries import EmailFilters
-from mailklient.services.mail_read import MailReadService
+from mailklient.services.mail_service import MailService
 
-reader = MailReadService(default_database_path())
+reader = MailService(default_database_path())
 page = reader.search_emails(
     "invoice",
     EmailFilters(is_read=False, after="2026-01-01", mailbox="INBOX"),
@@ -138,7 +158,7 @@ an empty page. SQL diagnostics and original exception messages are not exposed.
 Provider/authentication error translation is left to a future explicit network
 service; these read operations never authenticate or contact a provider.
 
-The `mailklient.services.mail_read` logger emits INFO records with `operation`,
+The `mailklient.services.mail_service` logger emits INFO records with `operation`,
 `success`, `duration_ms`, `result_count`, and `error_type`. It does not log search
 arguments, identifiers, message content, addresses, attachment names, passwords,
 tokens or exception tracebacks. Configure handlers/retention in the application
@@ -163,33 +183,53 @@ An always-on sync runner, headless OAuth/bootstrap and unattended keyring access
 still need implementation and testing. A headless reader by itself does not keep
 mail fresh. Moving to a NAS is not enabled merely by setting the database path.
 
-## Building the future adapter
+## Validation
 
-1. Add a thin adapter module that constructs only `MailReadService`. Explicitly
-   register the seven read operations with input/output schemas; do not discover
-   and publish every method in `services/` automatically. Map stable domain
-   errors to tool errors. MCP supports structured tool results and schemas;
-   see the [official tool specification](https://modelcontextprotocol.io/specification/2025-11-25/server/tools).
-2. SQLite is synchronous. An async adapter should use `asyncio.to_thread` rather
-   than blocking its event loop. No conversion of the entire client to async is
-   necessary; connections are created inside each operation.
-3. Add caller authentication, explicit account scope checks on every search and
-   ID lookup, response-size budgets and rate limits before remote exposure.
+Run the service and UI integration tests without a visible desktop:
+
+```bash
+QT_QPA_PLATFORM=offscreen .venv/bin/python -m pytest -q \
+  tests/test_mail_service.py tests/test_mail_read.py tests/test_mail_read_ui.py
+```
+
+These cover an injected repository without SQLite, validation before repository
+access, real temporary caches, search/filter combinations, deterministic paging,
+unread selection, detail serialization, thread isolation between accounts,
+missing ancestors/cycles, migration, stable errors and private logs. They also
+check that reads leave cache bytes and read flags unchanged, avoid credentials
+and network calls, and import without Qt. The UI tests exercise injected service
+use and lists spanning multiple pages. Run the full suite with
+`QT_QPA_PLATFORM=offscreen .venv/bin/python -m pytest -q`.
+
+## Local adapter and future remote access
+
+`mcp_server/server.py` registers five tools explicitly: `search_emails`,
+`get_recent_emails`, `get_unread_emails`, `get_email` and `get_thread`. It converts
+JSON filters to domain filters and uses `asyncio.to_thread` to call `MailService`.
+Pydantic models provide transport schemas while reusing the domain message and
+attachment models. Errors become MCP tool errors, and structured responses have
+a 1 MiB budget. The CLI constructs only `MailService`, never `MailStore`.
+The SDK is an optional extra and is not imported by the desktop.
+
+The remaining considerations for future remote deployment are:
+
+1. Add caller authentication, explicit account scope checks on every search and
+   ID lookup, request-size limits and rate limits before remote exposure.
    Current filters are query options, **not authorization**. Read-only means no
    mutations, not permission to disclose all accounts. Tailscale access does not
    replace application authorization; consult the
    [MCP security guidance](https://modelcontextprotocol.io/docs/2025-11-25/tutorials/security/security_best_practices).
-4. Choose transport/bind address/port through deployment configuration. Keep
-   stdout reserved for protocol messages when using stdio. Add adapter tests for
-   schemas, serialization, authentication, scope and error mapping.
-5. Treat all email/HTML/attachment content as untrusted data, never instructions
+2. Choose transport/bind address/port through deployment configuration. Extend
+   the local protocol tests with remote authentication, account-scope enforcement
+   and transport tests.
+3. Treat all email/HTML/attachment content as untrusted data, never instructions
    to the agent. Decide explicitly what may be sent to an external AI provider.
    Summaries and action classification belong above this retrieval layer.
-6. Later downloads and write tools require separate grants and services. Sending,
+4. Later downloads and write tools require separate grants and services. Sending,
    deleting, moving, archiving and marking read must not become available through
    a read grant. Require confirmation for appropriate write actions. Do not rely
    on tool annotations alone to enforce access control.
 
-Attachment metadata is ready; remote attachment retrieval, content-size limits,
-safe resource delivery, a background server process, AI summaries and the actual
-MCP transport/SDK integration are deliberately not implemented here.
+Attachment metadata is ready; remote attachment retrieval, download-size limits,
+safe resource delivery, an always-on sync process, remote MCP transports and AI
+summaries are not implemented here.

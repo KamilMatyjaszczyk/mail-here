@@ -13,7 +13,7 @@ from mailklient.database.repositories import (
     list_attachments_for_message,
 )
 from mailklient.database.thread_index import THREAD_CTE
-from mailklient.domain.errors import EmailNotFound, ThreadNotFound
+from mailklient.domain.errors import EmailNotFound, MailStoreUnavailable, ThreadNotFound
 from mailklient.domain.folders import standard_folder_name
 from mailklient.domain.mail_queries import (
     EmailDetails,
@@ -32,29 +32,34 @@ class MailReadRepository:
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
-        with closing(
-            sqlite3.connect(self._path.as_uri() + "?mode=ro", uri=True)
-        ) as connection:
-            connection.row_factory = sqlite3.Row
-            connection.execute("PRAGMA query_only = ON")
-            connection.create_function("casefold", 1, str.casefold, deterministic=True)
-            connection.create_function(
-                "mail_date", 2, cached_timestamp, deterministic=True
-            )
-            connection.create_function(
-                "mailbox_role",
-                1,
-                lambda value: standard_folder_name(value) if value else None,
-                deterministic=True,
-            )
-            connection.create_function(
-                "has_address",
-                2,
-                lambda header, address: address in mailbox_addresses(header),
-                deterministic=True,
-            )
-            connection.execute("BEGIN")
-            yield connection
+        try:
+            with closing(
+                sqlite3.connect(self._path.as_uri() + "?mode=ro", uri=True)
+            ) as connection:
+                connection.row_factory = sqlite3.Row
+                connection.execute("PRAGMA query_only = ON")
+                connection.create_function("casefold", 1, str.casefold, deterministic=True)
+                connection.create_function(
+                    "mail_date", 2, cached_timestamp, deterministic=True
+                )
+                connection.create_function(
+                    "mailbox_role",
+                    1,
+                    lambda value: standard_folder_name(value) if value else None,
+                    deterministic=True,
+                )
+                connection.create_function(
+                    "has_address",
+                    2,
+                    lambda header, address: address in mailbox_addresses(header),
+                    deterministic=True,
+                )
+                connection.execute("BEGIN")
+                yield connection
+        except (sqlite3.Error, OSError):
+            raise MailStoreUnavailable(
+                "Local mail cache is unavailable. Check that it exists and is up to date."
+            ) from None
 
     def search(
         self,

@@ -220,14 +220,22 @@ src/mailklient/
   workers/   Background jobs for the GUI
 ```
 
-The GUI uses services; network operations run outside the GUI thread. A separate
-`MailReadService` provides structured results for recent and unread messages,
+The GUI uses services; network operations run outside the GUI thread. The shared
+`MailService` provides structured results for recent and unread messages,
 combinable search filters, message details, local threads and attachment metadata.
 
-This prepares for a future AI/MCP adapter. **There is no MCP server or active
-AI integration yet.** The read layer performs no sync or write operations.
-See the [MCP architecture](docs/MCP_ARCHITECTURE.md) for the API, security boundaries
-and remaining work before an adapter can be exposed.
+The read path is `UI → MailService → MailRepository → SQLite`. Search validation
+and page traversal live in the service; SQL and storage errors live in the
+repository. Both the UI's service and the service's repository can be injected
+for testing. `MailReadService` remains a compatibility name for `MailService`.
+
+An optional **local read-only MCP server** now wraps `MailService` over stdio.
+Install it with `.venv/bin/python -m pip install -e '.[mcp]'` and configure a local
+MCP client to launch `.venv/bin/mcpMail-mcp`. It exposes five read tools and reads
+only the existing cache. No sending, deletion, archiving or automatic AI
+connection is included. See the [local MCP guide](docs/mcp.md) for configuration
+and protocol tests, and the [MCP architecture](docs/MCP_ARCHITECTURE.md) for the
+service contracts and remaining remote-deployment work.
 
 ## Known limitations
 
@@ -236,7 +244,7 @@ and remaining work before an adapter can be exposed.
 - Old messages without stored thread references cannot be grouped reliably.
 - Large inboxes, network interruptions and prolonged use need further stability testing.
 - The HTML viewer may not render every element the same way as webmail.
-- Automatic backups, a complete MCP server and Flatpak/AppImage distribution are not implemented.
+- Automatic backups, remote MCP access and Flatpak/AppImage distribution are not implemented.
 - The project does not yet have a chosen license. RPM packages are unsigned.
 - CI builds and tests the Fedora 44 package; this workflow does not cover other Linux versions.
 

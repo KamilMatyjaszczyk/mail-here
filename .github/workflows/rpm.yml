@@ -1,0 +1,60 @@
+name: mcpMail Fedora RPM
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - "mailklient/**"
+      - ".github/workflows/rpm.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Build, test and verify installation
+        env:
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: |
+          args=()
+          if [[ -n "$RELEASE_TAG" ]]; then
+            args+=(--tag "$RELEASE_TAG")
+          fi
+          python3 mailklient/packaging/rpm/build.py --engine docker --check-install "${args[@]}"
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: mcpmail-fedora-44
+          path: |
+            mailklient/dist/rpm/mcpmail-*.rpm
+            mailklient/dist/rpm/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: mcpmail-fedora-44
+          path: artifacts
+      - name: Create a draft release for review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" artifacts/*.rpm artifacts/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --draft --prerelease \
+            --title "mcpMail $RELEASE_TAG (Fedora 44)" \
+            --notes 'Personal alpha for Fedora 44. Install the .noarch.rpm with dnf. Each user supplies their own OAuth app registration. Review the missing project license and unsigned RPMs before publishing.'

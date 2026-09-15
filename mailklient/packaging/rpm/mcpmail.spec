@@ -52,6 +52,7 @@ export PYTHON_KEYRING_BACKEND=keyring.backends.fail.Keyring
 %doc README.md docs LICENSE-NOTICE
 %{_bindir}/mcpMail
 %{_bindir}/mcpMail-launcher
+%{_bindir}/mcpMail-mcp
 %{_bindir}/mailklient
 %{_bindir}/mailklient-launcher
 %{_datadir}/applications/mailklient.desktop

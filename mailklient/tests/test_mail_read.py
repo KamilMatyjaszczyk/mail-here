@@ -22,7 +22,7 @@ from mailklient.domain.errors import (
 from mailklient.domain.mail_queries import EmailFilters
 from mailklient.mail.imap_client import _parse_message_header
 from mailklient.services import MailStore
-from mailklient.services.mail_read import MailReadService
+from mailklient.services.mail_service import MailService
 from mailklient.services.mail_send import MailSendService
 from mailklient.services.mail_sync import MailSyncService
 
@@ -86,7 +86,7 @@ def mailbox(tmp_path):
     )
     return SimpleNamespace(
         store=store,
-        reader=MailReadService(store.database_path),
+        reader=MailService(store.database_path),
         account=account,
         other=other,
         inbox=inbox,
@@ -322,6 +322,8 @@ def test_reading_never_writes_or_contacts_providers(mailbox, monkeypatch):
     monkeypatch.setattr("socket.create_connection", forbidden)
     before = mailbox.store.database_path.read_bytes()
     mailbox.reader.get_recent_emails()
+    mailbox.reader.search_emails("Plan")
+    mailbox.reader.get_unread_emails()
     mailbox.reader.get_email(mailbox.first.id)
     mailbox.reader.get_attachments(mailbox.first.id)
     mailbox.reader.get_thread(mailbox.first.id)
@@ -338,11 +340,23 @@ def test_reading_never_writes_or_contacts_providers(mailbox, monkeypatch):
     )
 
 
+@pytest.mark.parametrize("page_size", [1, 2, 4, 200])
+@pytest.mark.parametrize("sort_order", ["date_desc", "date_asc", "subject", "sender"])
+def test_iteration_preserves_all_results_and_scope(mailbox, page_size, sort_order):
+    filters = EmailFilters(account_id=mailbox.account.id)
+    expected = mailbox.reader.search_emails(filters=filters, sort_order=sort_order)
+    actual = tuple(mailbox.reader.iter_emails(
+        filters=filters, page_size=page_size, sort_order=sort_order
+    ))
+    assert actual == expected.items
+    assert tuple(mailbox.reader.iter_emails("no matches", page_size=page_size)) == ()
+
+
 def test_database_failures_are_stable_and_logs_are_private(
     mailbox, monkeypatch, caplog
 ):
     private = "do-not-log-password-or-mail@example.com"
-    caplog.set_level(logging.INFO, logger="mailklient.services.mail_read")
+    caplog.set_level(logging.INFO, logger="mailklient.services.mail_service")
     mailbox.reader.search_emails(private)
     mailbox.reader.get_attachments(mailbox.first.id)
     with pytest.raises(EmailNotFound):
@@ -351,14 +365,14 @@ def test_database_failures_are_stable_and_logs_are_private(
     def failed(*_args, **_kwargs):
         raise sqlite3.OperationalError(private)
 
-    monkeypatch.setattr(mailbox.reader._repository, "search", failed)
+    monkeypatch.setattr(sqlite3, "connect", failed)
     with pytest.raises(MailStoreUnavailable) as caught:
         mailbox.reader.get_recent_emails()
     assert private not in str(caught.value) and caught.value.__suppress_context__
     records = [
         record
         for record in caplog.records
-        if record.name == "mailklient.services.mail_read"
+        if record.name == "mailklient.services.mail_service"
     ]
     assert [record.operation for record in records] == [
         "search_emails",
@@ -376,7 +390,7 @@ def test_database_failures_are_stable_and_logs_are_private(
 
 def test_missing_or_broken_cache_does_not_get_created_or_migrated(tmp_path):
     path = tmp_path / "missing" / "cache.sqlite3"
-    reader = MailReadService(path)
+    reader = MailService(path)
     with pytest.raises(MailStoreUnavailable):
         reader.get_recent_emails()
     assert not path.parent.exists()
@@ -385,7 +399,7 @@ def test_missing_or_broken_cache_does_not_get_created_or_migrated(tmp_path):
         pass
     before = broken.read_bytes()
     with pytest.raises(MailStoreUnavailable):
-        MailReadService(broken).get_email(1)
+        MailService(broken).get_email(1)
     assert broken.read_bytes() == before
 
 
@@ -445,7 +459,7 @@ def test_configuration_and_headless_import(tmp_path):
             "-B",
             "-c",
             (
-                "import sys\nfrom mailklient.services.mail_read import MailReadService\n"
+                "import sys\nfrom mailklient.services.mail_service import MailService\n"
                 "from mailklient.config import default_database_path\n"
                 "assert not any(name.startswith('PySide6') for name in sys.modules)\n"
             ),

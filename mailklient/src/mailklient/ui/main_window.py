@@ -68,7 +68,7 @@ from mailklient.services.account_settings import AccountSettingsService
 from mailklient.services.attachments import AttachmentService
 from mailklient.services.bridge_runtime import BridgeRuntimeService, BridgeStatus
 from mailklient.services.drafts import DraftService
-from mailklient.services.mail_read import MAX_PAGE_SIZE, MailReadService
+from mailklient.services.mail_service import MailService
 from mailklient.services.tuta_setup import TutaSetupService
 from mailklient.ui.account_dialog import AccountDialog
 from mailklient.ui.attachment_controller import AttachmentController
@@ -116,10 +116,15 @@ class MainWindow(QMainWindow):
         oauth_login_service: OAuthLoginService | None = None,
         bridge_runtime_service: BridgeRuntimeService | None = None,
         preferences: QSettings | None = None,
+        *,
+        mail_service: MailService | None = None,
     ) -> None:
         super().__init__()
         self._mail_store = mail_store
-        self._mail_reader = MailReadService(mail_store.database_path)
+        self._mail_service = (
+            mail_service if mail_service is not None
+            else MailService(mail_store.database_path)
+        )
         self._layout_controller = ColumnLayoutController(self)
         self._attachment_controller = AttachmentController(self)
         self._task_runner = TaskRunner(self)
@@ -927,19 +932,11 @@ class MainWindow(QMainWindow):
             account_id=account_id, mailbox=role,
             is_read=False if self.unread_filter_checkbox.isChecked() else None,
         )
-        messages = []
-        offset = 0
         try:
-            # Keep the existing full-list UI while the shared API stays paginated.
-            while True:
-                page = self._mail_reader.search_emails(
-                    self.message_search_edit.text(), filters, limit=MAX_PAGE_SIZE,
-                    offset=offset, sort_order=self.message_sort_combo.currentData(),
-                )
-                messages.extend(page.items)
-                if page.next_offset is None:
-                    break
-                offset = page.next_offset
+            messages = list(self._mail_service.iter_emails(
+                self.message_search_edit.text(), filters,
+                sort_order=self.message_sort_combo.currentData(),
+            ))
         except MailReadError as error:
             self.sync_status_label.setText(str(error))
             return
@@ -1034,7 +1031,7 @@ class MainWindow(QMainWindow):
 
         message_id = current.data(Qt.ItemDataRole.UserRole)
         try:
-            details = self._mail_reader.get_email(message_id)
+            details = self._mail_service.get_email(message_id)
         except MailReadError as error:
             self.message_view.set_empty()
             self._show_attachments([])
@@ -1443,7 +1440,12 @@ class MainWindow(QMainWindow):
         if message_id is None:
             return False
 
-        if self._mail_store.list_attachments(message_id):
+        try:
+            attachments = self._mail_service.get_attachments(message_id)
+        except MailReadError as error:
+            self.sync_status_label.setText(str(error))
+            return False
+        if attachments:
             return self._start_task(
                 "Preparing forwarded message...",
                 lambda: self._mail_send_service.create_forward_draft(message_id),
