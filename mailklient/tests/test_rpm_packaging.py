@@ -19,7 +19,7 @@ BUILDER = runpy.run_path(str(PROJECT / "packaging/rpm/build.py"))
 def source_tree(tmp_path):
     project = tmp_path / "project"
     for source in BUILDER["source_files"](PROJECT):
-        target = project / source.relative_to(PROJECT)
+        target = project / BUILDER["source_relative_path"](PROJECT, source)
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, target)
     return project
@@ -30,6 +30,33 @@ def test_rpm_and_python_versions_agree():
     assert BUILDER["project_version"](PROJECT, f"v{version}") == version
     with pytest.raises(ValueError, match="Release tag"):
         BUILDER["project_version"](PROJECT, "v999.0.0")
+
+
+def test_repository_readme_is_packaged_and_can_be_rebuilt(source_tree, tmp_path):
+    readme = source_tree / "README.md"
+    content = readme.read_bytes()
+    readme.rename(source_tree.parent / "README.md")
+    version = BUILDER["project_version"](source_tree)
+    archive = BUILDER["prepare_sources"](source_tree, tmp_path / "first", version)
+    extracted = tmp_path / "extracted"
+    with tarfile.open(archive) as source:
+        assert source.extractfile(f"mcpmail-{version}/README.md").read() == content
+        assert all(".." not in Path(name).parts for name in source.getnames())
+        source.extractall(extracted, filter="data")
+    rebuilt = BUILDER["prepare_sources"](
+        extracted / f"mcpmail-{version}", tmp_path / "second", version
+    )
+    with tarfile.open(rebuilt) as source:
+        assert source.extractfile(f"mcpmail-{version}/README.md").read() == content
+
+
+def test_repository_readme_symlink_is_rejected(source_tree, tmp_path):
+    (source_tree / "README.md").unlink()
+    private = tmp_path / "private.md"
+    private.write_text("not for distribution")
+    (source_tree.parent / "README.md").symlink_to(private)
+    with pytest.raises(ValueError, match="Symlinks"):
+        BUILDER["source_files"](source_tree)
 
 
 def test_rpm_version_mismatch_is_rejected(source_tree):

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mcpMail"
-version = "0.1.0"
+version = "1.0.0"
 description = "A lightweight, modular desktop email client for Linux."
 readme = "README.md"
 requires-python = ">=3.11"

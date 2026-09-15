@@ -1,5 +1,5 @@
 Name:           mcpmail
-Version:        0.1.0
+Version:        1.0.0
 Release:        1%{?dist}
 Summary:        Desktop email client with a unified inbox
 
@@ -58,5 +58,8 @@ export PYTHON_KEYRING_BACKEND=keyring.backends.fail.Keyring
 %{_datadir}/applications/mailklient.desktop
 
 %changelog
+* Wed Sep 09 2026 mcpMail contributors - 1.0.0-1
+- Bump release version to 1.0.0.
+
 * Tue Sep 08 2026 mcpMail contributors - 0.1.0-1
 - Rename to mcpMail, preserving existing data and legacy commands.

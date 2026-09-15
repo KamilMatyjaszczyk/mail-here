@@ -40,8 +40,20 @@ def project_version(project: Path, tag: str | None = None) -> str:
     return version
 
 
+def source_relative_path(project: Path, path: Path) -> Path:
+    # The checkout keeps its README at repository root; source RPMs keep it
+    # alongside pyproject.toml so setuptools can build the extracted archive.
+    if path == project.parent / "README.md":
+        return Path("README.md")
+    return path.relative_to(project)
+
+
 def source_files(project: Path) -> list[Path]:
-    paths = [project / name for name in ("pyproject.toml", "README.md", "MANIFEST.in")]
+    readme = project / "README.md"
+    if not readme.exists() and not readme.is_symlink():
+        readme = project.parent / "README.md"
+    paths = [project / name for name in ("pyproject.toml", "MANIFEST.in")]
+    paths.append(readme)
     paths.extend(project / "packaging/rpm" / name for name in PACKAGING_FILES)
     # Include code, docs and synthetic tests only, never the entire checkout.
     for directory, patterns in (
@@ -53,21 +65,23 @@ def source_files(project: Path) -> list[Path]:
         for pattern in patterns:
             paths.extend(root.rglob(pattern))
     for path in paths:
+        relative = source_relative_path(project, path)
+        base = project.parent if path == project.parent / "README.md" else project
         if not path.is_file():
             raise ValueError(
-                f"Missing regular source file: {path.relative_to(project)}"
+                f"Missing regular source file: {relative}"
             )
-        for part in (path, *path.relative_to(project).parents):
-            candidate = part if part.is_absolute() else project / part
+        for part in (path, *relative.parents):
+            candidate = part if part.is_absolute() else base / part
             if candidate.is_symlink():
                 raise ValueError(
-                    f"Symlinks are not packaged: {path.relative_to(project)}"
+                    f"Symlinks are not packaged: {relative}"
                 )
         if any(
             part.startswith(".") or part == "__pycache__"
-            for part in path.relative_to(project).parts
+            for part in relative.parts
         ):
-            raise ValueError(f"Hidden source path: {path.relative_to(project)}")
+            raise ValueError(f"Hidden source path: {relative}")
     return sorted(set(paths))
 
 
@@ -80,7 +94,7 @@ def prepare_sources(project: Path, topdir: Path, version: str) -> Path:
     archive = sources / f"mcpmail-{version}.tar.gz"
     with tarfile.open(archive, "w:gz") as output:
         for path in source_files(project):
-            name = f"mcpmail-{version}/{path.relative_to(project).as_posix()}"
+            name = f"mcpmail-{version}/{source_relative_path(project, path).as_posix()}"
             info = output.gettarinfo(str(path), arcname=name)
             info.uid = info.gid = 0
             info.uname = info.gname = "root"
