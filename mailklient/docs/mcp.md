@@ -80,6 +80,26 @@ non-null `next_offset` as the next call's `offset`, keeping the other arguments
 the same. Results have both structured content and a JSON text representation,
 with advertised input/output schemas.
 
+Unknown arguments are rejected before any mail is read. Every tool's input
+schema sets `additionalProperties: false`, including the nested `filters`
+object where supported. For example, `query` on `get_unread_emails`, a misspelled
+`limti`, or a top-level `is_read` on `search_emails` produces an error rather
+than silently broadening the request or applying defaults.
+
+For unread mail about a topic, call `search_emails` with both `query` and
+`filters.is_read`, for example:
+
+```json
+{"query": "package", "filters": {"is_read": false}, "limit": 3}
+```
+
+`get_unread_emails` alone returns the newest unread mail regardless of topic.
+Search filters apply before the result limit, and text matching does not expand
+synonyms. Read full content using `get_email` or `get_thread` before summarizing;
+the server cannot verify whether an AI client follows this retrieval procedure.
+Restart the MCP client after updating the server so its subprocess and discovered
+schemas are refreshed.
+
 Limits range from 1 to 200; offsets from 0 to 1,000,000. Each structured result
 is limited to 1 MiB before protocol framing and the compatibility text copy.
 An oversized result returns `ResponseTooLarge` without partial mail; reduce the
@@ -111,6 +131,9 @@ validate response schemas, test errors and pagination, and check that database
 bytes and read flags stay unchanged. No real mail account or AI provider is used.
 Other tests use an in-memory MCP connection to verify service delegation, worker
 thread execution, input validation and response-size limits.
+Regression tests cover rejection of unknown arguments on every tool before
+service access, rejection over stdio in both protocol modes, and a package search
+that excludes unrelated unread mail and already-read package mail.
 
 The MCP tests are skipped if the optional SDK is absent. Install `.[mcp,dev]`
 to run them. The full suite also requires local sockets for IMAP/OAuth fixtures.
@@ -134,3 +157,13 @@ Use `get_email` with a returned id to read full contents. `get_thread` continues
 to return full messages for thread summaries. Large detail/thread results can
 still exceed a client's context budget. This reduces serialized list payloads,
 not the amount of data MailService reads internally.
+
+## Plain-text detail pages
+
+get_email now returns up to 4000 plain-text characters by default, without HTML
+or duplicate previews. offset/limit are character positions; maximum limit is
+8000. Follow non-null next_offset with the same email_id and limit. total_chars
+and content_available describe the cached text. HTML-only mail is explicitly
+reported as missing plain text; no conversion or fetching occurs. Attachments
+remain metadata. Large headers or attachment lists may still exceed client
+limits. This changes the output schema; rediscover tools after restarting.

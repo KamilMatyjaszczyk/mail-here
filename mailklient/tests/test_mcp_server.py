@@ -11,7 +11,7 @@ import pytest
 pytest.importorskip("mcp.server.mcpserver", reason="Install the optional .[mcp] dependencies")
 
 import anyio
-from jsonschema import validate
+from jsonschema import ValidationError, validate
 from mcp import Client
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
@@ -84,6 +84,24 @@ async def test_stdio_discovery_queries_schemas_and_no_writes(cache, tmp_path, mo
                 assert tool.annotations.read_only_hint is True
                 assert tool.annotations.destructive_hint is False
                 assert tool.output_schema is not None
+                assert tool.input_schema["additionalProperties"] is False
+
+            # Exercise validation over stdio, including clients that do not
+            # validate the advertised schema before submitting a tool call.
+            for name, args in [
+                ("get_unread_emails", {"query": "private-topic", "limit": 3}),
+                ("get_recent_emails", {"query": "private-topic"}),
+                ("search_emails", {"query": "invoice", "is_read": False}),
+                ("get_email", {"email_id": cache.root.id, "mark_read": True}),
+                ("get_thread", {"thread_id": cache.root.id, "filters": {"is_read": False}}),
+            ]:
+                with pytest.raises(ValidationError):
+                    validate(args, tools[name].input_schema)
+                rejected = await client.call_tool(name, args)
+                assert rejected.is_error
+                assert rejected.structured_content is None
+                assert "Extra inputs are not permitted" in rejected.content[0].text
+                assert "private-topic" not in rejected.content[0].text
 
             async def call(name, args):
                 result = await client.call_tool(name, args)
@@ -121,6 +139,62 @@ async def test_stdio_discovery_queries_schemas_and_no_writes(cache, tmp_path, mo
         assert "alice@example.com" not in log
     assert cache.path.read_bytes() == before
     assert cache.store.get_message(cache.root.id).is_read is False
+
+
+@pytest.mark.anyio
+async def test_unknown_arguments_never_reach_mail_service():
+    service = Mock(spec=MailService)
+    async with Client(create_server(service)) as client:
+        for name, args in [
+            ("get_unread_emails", {"query": "package", "limit": 3}),
+            ("get_recent_emails", {"limti": 3}),
+            ("search_emails", {"query": "package", "is_read": False}),
+            ("get_email", {"email_id": 1, "mark_read": True}),
+            ("get_thread", {"thread_id": 1, "query": "package"}),
+            ("search_emails", {"filters": {"unread": True}}),
+            ("get_recent_emails", {"filters": {"query": "package"}}),
+            ("get_unread_emails", {"filters": {"unknown": "private-value"}}),
+        ]:
+            result = await client.call_tool(name, args)
+            assert result.is_error
+            assert "Extra inputs are not permitted" in result.content[0].text
+            assert "private-value" not in result.content[0].text
+            assert service.mock_calls == []
+
+
+@pytest.mark.anyio
+async def test_package_search_filters_before_limiting_and_details_supply_body(cache):
+    for subject, body, is_read, date in [
+        ("Package update", "Collect at locker 7429 before 18:45.", False, "2026-09-10T08:29:00Z"),
+        ("Membership news", "Your membership has been renewed.", False, "2026-09-10T08:00:00Z"),
+        ("Package delivered", "Already read.", True, "2026-09-10T07:30:00Z"),
+        ("Collected by carrier", "Your package is in transit.", False, "2026-09-10T07:03:00Z"),
+    ]:
+        cache.store.add_message(
+            cache.account.id, cache.root.folder_id, subject=subject,
+            body_text=body, is_read=is_read, received_at=date,
+        )
+    before = cache.path.read_bytes()
+    async with Client(create_server(MailService(cache.path))) as client:
+        unread = await client.call_tool("get_unread_emails", {"limit": 3})
+        assert [m["subject"] for m in unread.structured_content["items"]] == [
+            "Package update", "Membership news", "Collected by carrier",
+        ]
+        rejected = await client.call_tool("get_unread_emails", {"query": "package", "limit": 3})
+        assert rejected.is_error
+        for limit, expected in [(1, ["Package update"]), (3, ["Package update", "Collected by carrier"])]:
+            result = await client.call_tool("search_emails", {
+                "query": "package", "filters": {"is_read": False}, "limit": limit,
+            })
+            assert not result.is_error
+            items = result.structured_content["items"]
+            assert [m["subject"] for m in items] == expected
+            assert all(m["is_read"] is False and "body_text" not in m for m in items)
+        detail = await client.call_tool("get_email", {"email_id": items[0]["id"]})
+        assert not detail.is_error
+        assert detail.structured_content["message"]["body_text"] == "Collect at locker 7429 before 18:45."
+        assert detail.structured_content["message"]["is_read"] is False
+    assert cache.path.read_bytes() == before
 
 
 @pytest.mark.anyio
@@ -217,7 +291,7 @@ async def test_oversized_result_returns_error_without_partial_mail(cache):
             assert "body_html" not in data["items"][0]
             assert "body_preview" not in data["items"][0]
             assert len(result.content[0].text) < 12000
-        result = await client.call_tool("get_email", {"email_id": large.id})
+        result = await client.call_tool("get_thread", {"thread_id": large.id})
         assert result.is_error
         assert "ResponseTooLarge" in result.content[0].text
         assert result.structured_content is None
@@ -237,3 +311,34 @@ def test_server_import_is_headless_and_cli_has_no_network_transport():
     assert result.returncode != 0
     assert "absolute path" in result.stderr
     assert result.stdout == ""
+
+
+@pytest.mark.anyio
+async def test_text_pages_are_bounded_and_reassemble(cache):
+    text = "Æ package details\n" * 600
+    message = cache.store.add_message(cache.account.id, cache.root.folder_id,
+        body_text=text, body_html="x" * MAX_RESPONSE_BYTES)
+    html = cache.store.add_message(cache.account.id, cache.root.folder_id, body_html="<p>Only HTML</p>")
+    before = cache.path.read_bytes()
+    async with Client(create_server(MailService(cache.path))) as client:
+        result = await client.call_tool("get_email", {"email_id": message.id})
+        assert not result.is_error
+        assert len(result.content[0].text) < 12000
+        assert len(result.structured_content["message"]["body_text"]) == 4000
+        assert "body_html" not in result.structured_content["message"]
+        offset, chunks = 0, []
+        while offset is not None:
+            result = await client.call_tool("get_email", {"email_id": message.id, "offset": offset, "limit": 1000})
+            assert not result.is_error
+            page = result.structured_content
+            assert page["offset"] == offset
+            chunks.append(page["message"]["body_text"])
+            offset = page["next_offset"]
+        assert "".join(chunks) == text
+        result = await client.call_tool("get_email", {"email_id": message.id, "offset": len(text)+1})
+        assert result.is_error
+        result = await client.call_tool("get_email", {"email_id": html.id})
+        assert not result.is_error
+        assert result.structured_content["content_available"] is False
+        assert result.structured_content["has_html"] is True
+    assert cache.path.read_bytes() == before
